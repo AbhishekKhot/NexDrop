@@ -1,5 +1,23 @@
 /**
  * Lan.tsx
+ * LAN mode page — peer discovery, file sending, and transfer progress for
+ * devices on the same local network.
+ *
+ * Data flow:
+ *  App.tsx → useAgentSocket() → props here
+ *
+ * This component is purely presentational relative to the agent connection:
+ * it receives peers and transfers as props and calls onSendFile / onDiscover
+ * callbacks.  It owns only local UI state (selectedPeer, dragging).
+ *
+ * Key design choices:
+ *  - SpeedSample is stored in a ref (not state) so updating it during render
+ *    does not trigger additional render cycles — the speed display updates
+ *    naturally on the next render triggered by a new transfer_update message.
+ *  - sendFile() wraps onSendFile in a try/catch to convert synchronous errors
+ *    (e.g. "File too large" thrown before the async stream starts) into toasts.
+ *    Async errors are caught in useAgentSocket.sendFile → setLastError → App.tsx
+ *    useEffect → addToast.
  *
  * Fixes applied:
  *  ERR-05 — Send errors surfaced via toast
@@ -22,7 +40,22 @@ interface LanProps {
     onDiscover: () => void;
 }
 
-// QUAL-01: track per-transfer speed metrics outside of React state (avoids rerenders)
+/**
+ * SpeedSample — per-transfer speed tracking structure stored in a ref Map.
+ *
+ * Why a ref and not state?
+ * Speed samples are derived UI data — not source data that should cause a
+ * component to re-render on their own.  Storing them in state would trigger
+ * an extra render every time the EMA is updated (every second during a transfer),
+ * doubling render frequency.  A ref update is invisible to React's diffing,
+ * so the speed display is refreshed only when the parent already re-renders due
+ * to a new transfer_update message.
+ *
+ * Fields:
+ *  lastChunks  — chunksReceived at the time of the last sample (for delta calc)
+ *  lastAt      — timestamp of last sample (ms since epoch)
+ *  bytesPerSec — exponential moving average speed (0 until first full second elapses)
+ */
 interface SpeedSample {
     lastChunks: number;
     lastAt: number;
@@ -35,10 +68,24 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
     const [dragging, setDragging] = React.useState(false);
     const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-    // QUAL-01: speed samples ref, updated on each render
+    /**
+     * QUAL-01: speed samples ref — keyed by transfer ID.
+     *
+     * A single Map is used (not individual refs per transfer) so new transfers
+     * can be added and old ones removed without changing the ref object itself.
+     * React's ref guarantee means the Map reference is stable across renders.
+     */
     const speedSamples = useRef<Map<string, SpeedSample>>(new Map());
 
-    // Remove samples for transfers that are no longer active
+    /**
+     * Cleanup: remove speed samples for transfers that are no longer 'transferring'.
+     *
+     * Why no deps array (runs on every render)?
+     * This effect fires after every render, which is intentional — the transfers
+     * prop changes on every transfer_update message, so there is no benefit to
+     * gating on a specific dep.  The per-key lookup is O(n) on the sample count,
+     * which is bounded by the number of concurrent transfers (typically 1-2).
+     */
     useEffect(() => {
         for (const id of speedSamples.current.keys()) {
             const t = transfers.get(id);
@@ -48,6 +95,16 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         }
     });
 
+    /**
+     * handleFileDrop — drag-and-drop entry point.
+     *
+     * e.preventDefault() suppresses the browser's default behaviour of navigating
+     * to the dropped file (for text/URI-list drops) or opening it inline (for images).
+     *
+     * Only the first file is taken (files[0]); multi-file drag is not supported —
+     * the agent's serial queue would handle it, but the UX for tracking multiple
+     * concurrent drops is not implemented.
+     */
     function handleFileDrop(e: React.DragEvent) {
         e.preventDefault();
         setDragging(false);
@@ -56,6 +113,13 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         if (file) sendFile(selectedPeer.id, file);
     }
 
+    /**
+     * handleFileInput — file picker (click-to-browse) entry point.
+     *
+     * e.target.value = '' resets the input element after the file is taken.
+     * Without this reset, selecting the same file twice in a row would not fire
+     * a second onChange event (the browser considers the value unchanged).
+     */
     function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
         if (!selectedPeer) return;
         const file = e.target.files?.[0];
@@ -63,6 +127,16 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         e.target.value = '';
     }
 
+    /**
+     * sendFile — thin wrapper that catches synchronous errors from onSendFile.
+     *
+     * onSendFile (useAgentSocket.sendFile) is async internally, but it can throw
+     * synchronously for cases like "agent not connected" before the Promise is
+     * created.  The try/catch here converts those into toasts (ERR-05).
+     *
+     * Async errors (from inside the Promise) propagate via setLastError in
+     * useAgentSocket → the useEffect in App.tsx → addToast there.
+     */
     function sendFile(peerId: string, file: File) {
         try {
             onSendFile(peerId, file);
@@ -72,11 +146,42 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         }
     }
 
+    /**
+     * lanTransfers — filter the shared transfers Map to only include transfers
+     * whose peerId matches one of the LAN peers passed to this component.
+     *
+     * App.tsx already filters peers to mode === 'lan', so this filter is a
+     * secondary guard that prevents remote-mode transfers from appearing in the
+     * LAN transfer list if the data is ever inconsistent.
+     */
     const lanTransfers = Array.from(transfers.values()).filter((t) =>
         peers.some((p) => p.id === t.peerId)
     );
 
-    // QUAL-01: compute speed/ETA for a transferring transfer
+    /**
+     * getSpeedETA — compute human-readable speed and ETA for an active transfer.
+     *
+     * Returns null when:
+     *  - Transfer is not in 'transferring' state
+     *  - totalChunks is 0 (metadata not yet received)
+     *  - No full second has elapsed since the first sample (bytesPerSec still 0)
+     *
+     * Speed algorithm: Exponential Moving Average (EMA) with α = 0.3.
+     *  newSpeed = oldSpeed * 0.7 + instantaneousSpeed * 0.3
+     *
+     * Why EMA instead of a rolling window?
+     * EMA requires storing only one value (no array of past samples) and provides
+     * natural smoothing that dampens momentary spikes (e.g. from TCP burst-then-drain
+     * behavior) while still tracking trend changes within a few seconds.
+     *
+     * Why sample at 1-second intervals?
+     * Sub-second intervals produce noisy readings because chunk delivery from the
+     * agent to the UI is batched over WebSocket frames. 1 second gives a stable
+     * numerator (deltaBytesPerSec) while keeping the display responsive.
+     *
+     * chunkBytes = fileSize / totalChunks rather than the constant CHUNK_SIZE because
+     * the final chunk may be smaller — using the average is accurate enough for ETA.
+     */
     function getSpeedETA(t: Transfer): { speed: string; eta: string } | null {
         if (t.state !== 'transferring' || t.totalChunks === 0) return null;
 
@@ -85,21 +190,23 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         let sample = speedSamples.current.get(t.id);
 
         if (!sample) {
+            // First time we see this transfer — initialise the sample; no speed yet
             sample = { lastChunks: t.chunksReceived, lastAt: now, bytesPerSec: 0 };
             speedSamples.current.set(t.id, sample);
         } else {
             const elapsed = (now - sample.lastAt) / 1000;
             if (elapsed >= 1) {
+                // At least one full second has passed — compute delta and apply EMA
                 const deltaBytesPerSec = ((t.chunksReceived - sample.lastChunks) * chunkBytes) / elapsed;
                 sample.bytesPerSec = sample.bytesPerSec === 0
-                    ? deltaBytesPerSec
+                    ? deltaBytesPerSec                                    // first real sample — use directly
                     : sample.bytesPerSec * 0.7 + deltaBytesPerSec * 0.3; // EMA smoothing
                 sample.lastChunks = t.chunksReceived;
                 sample.lastAt = now;
             }
         }
 
-        if (sample.bytesPerSec === 0) return null;
+        if (sample.bytesPerSec === 0) return null; // not enough data yet
         const remaining = (t.totalChunks - t.chunksReceived) * chunkBytes;
         return { speed: formatSpeed(sample.bytesPerSec), eta: formatETA(remaining, sample.bytesPerSec) };
     }
