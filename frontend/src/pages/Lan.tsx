@@ -1,47 +1,117 @@
-import React from 'react';
+/**
+ * Lan.tsx
+ *
+ * Fixes applied:
+ *  ERR-05 — Send errors surfaced via toast
+ *  QUAL-01 — Speed and ETA displayed for in-progress transfers
+ */
+
+import React, { useRef, useEffect } from 'react';
 import type { Peer, Transfer } from '../types';
 import DeviceCard from '../components/DeviceCard';
 import ProgressBar from '../components/ProgressBar';
-import { formatBytes, formatState } from '../lib/utils';
+import { formatBytes, formatState, formatSpeed, formatETA } from '../lib/utils';
+import { useToast } from '../lib/toast';
 
 interface LanProps {
     peers: Peer[];
     transfers: Map<string, Transfer>;
     agentConnected: boolean;
+    agentFailed?: boolean;
     onSendFile: (peerId: string, file: File) => void;
     onDiscover: () => void;
 }
 
-export default function Lan({ peers, transfers, agentConnected, onSendFile, onDiscover }: LanProps) {
+// QUAL-01: track per-transfer speed metrics outside of React state (avoids rerenders)
+interface SpeedSample {
+    lastChunks: number;
+    lastAt: number;
+    bytesPerSec: number;
+}
+
+export default function Lan({ peers, transfers, agentConnected, agentFailed, onSendFile, onDiscover }: LanProps) {
+    const { addToast } = useToast();
     const [selectedPeer, setSelectedPeer] = React.useState<Peer | null>(null);
     const [dragging, setDragging] = React.useState(false);
     const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+    // QUAL-01: speed samples ref, updated on each render
+    const speedSamples = useRef<Map<string, SpeedSample>>(new Map());
+
+    // Remove samples for transfers that are no longer active
+    useEffect(() => {
+        for (const id of speedSamples.current.keys()) {
+            const t = transfers.get(id);
+            if (!t || t.state !== 'transferring') {
+                speedSamples.current.delete(id);
+            }
+        }
+    });
 
     function handleFileDrop(e: React.DragEvent) {
         e.preventDefault();
         setDragging(false);
         if (!selectedPeer) return;
         const file = e.dataTransfer.files[0];
-        if (file) onSendFile(selectedPeer.id, file);
+        if (file) sendFile(selectedPeer.id, file);
     }
 
     function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
         if (!selectedPeer) return;
         const file = e.target.files?.[0];
-        if (file) onSendFile(selectedPeer.id, file);
+        if (file) sendFile(selectedPeer.id, file);
         e.target.value = '';
+    }
+
+    function sendFile(peerId: string, file: File) {
+        try {
+            onSendFile(peerId, file);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            addToast(msg, 'error');
+        }
     }
 
     const lanTransfers = Array.from(transfers.values()).filter((t) =>
         peers.some((p) => p.id === t.peerId)
     );
 
+    // QUAL-01: compute speed/ETA for a transferring transfer
+    function getSpeedETA(t: Transfer): { speed: string; eta: string } | null {
+        if (t.state !== 'transferring' || t.totalChunks === 0) return null;
+
+        const chunkBytes = t.fileSize / t.totalChunks;
+        const now = Date.now();
+        let sample = speedSamples.current.get(t.id);
+
+        if (!sample) {
+            sample = { lastChunks: t.chunksReceived, lastAt: now, bytesPerSec: 0 };
+            speedSamples.current.set(t.id, sample);
+        } else {
+            const elapsed = (now - sample.lastAt) / 1000;
+            if (elapsed >= 1) {
+                const deltaBytesPerSec = ((t.chunksReceived - sample.lastChunks) * chunkBytes) / elapsed;
+                sample.bytesPerSec = sample.bytesPerSec === 0
+                    ? deltaBytesPerSec
+                    : sample.bytesPerSec * 0.7 + deltaBytesPerSec * 0.3; // EMA smoothing
+                sample.lastChunks = t.chunksReceived;
+                sample.lastAt = now;
+            }
+        }
+
+        if (sample.bytesPerSec === 0) return null;
+        const remaining = (t.totalChunks - t.chunksReceived) * chunkBytes;
+        return { speed: formatSpeed(sample.bytesPerSec), eta: formatETA(remaining, sample.bytesPerSec) };
+    }
+
     return (
         <div>
             <div className="page-header">
                 <h1>📡 LAN Transfer</h1>
                 <p>
-                    {agentConnected
+                    {agentFailed
+                        ? 'Agent unreachable — restart the backend and reload.'
+                        : agentConnected
                         ? 'Local agent connected — showing devices on your network.'
                         : 'Local agent is offline. Run `cd backend && npm run dev` to discover LAN peers.'}
                 </p>
@@ -52,15 +122,7 @@ export default function Lan({ peers, transfers, agentConnected, onSendFile, onDi
                 <div className="section-header">
                     <span className="section-title">
                         <span>Devices on Network</span>
-                        <span
-                            style={{
-                                background: 'var(--bg-elevated)',
-                                borderRadius: '99px',
-                                padding: '1px 8px',
-                                fontSize: '0.75rem',
-                                color: 'var(--text-secondary)',
-                            }}
-                        >
+                        <span style={{ background: 'var(--bg-elevated)', borderRadius: '99px', padding: '1px 8px', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
                             {peers.length}
                         </span>
                     </span>
@@ -89,7 +151,7 @@ export default function Lan({ peers, transfers, agentConnected, onSendFile, onDi
                 )}
             </div>
 
-            {/* File drop zone (only if a peer is selected) */}
+            {/* File drop zone */}
             {selectedPeer && (
                 <div className="section">
                     <div className="section-header">
@@ -112,12 +174,7 @@ export default function Lan({ peers, transfers, agentConnected, onSendFile, onDi
                         <span className="drop-icon">📁</span>
                         <p>Drag &amp; drop a file here, or <strong>click to browse</strong></p>
                     </div>
-                    <input
-                        ref={fileInputRef}
-                        type="file"
-                        style={{ display: 'none' }}
-                        onChange={handleFileInput}
-                    />
+                    <input ref={fileInputRef} type="file" style={{ display: 'none' }} onChange={handleFileInput} />
                 </div>
             )}
 
@@ -130,16 +187,26 @@ export default function Lan({ peers, transfers, agentConnected, onSendFile, onDi
                     <div className="transfer-list">
                         {lanTransfers.map((t) => {
                             const pct = t.totalChunks > 0 ? Math.round((t.chunksReceived / t.totalChunks) * 100) : 0;
+                            const speedETA = getSpeedETA(t);
                             return (
                                 <div className="transfer-item" key={t.id}>
-                                    <span className="transfer-icon">
-                                        {t.direction === 'send' ? '⬆️' : '⬇️'}
-                                    </span>
+                                    <span className="transfer-icon">{t.direction === 'send' ? '⬆️' : '⬇️'}</span>
                                     <div className="transfer-info">
                                         <div className="transfer-name">{t.fileName}</div>
                                         <div className="transfer-meta">
                                             {formatBytes(t.fileSize)} · {t.peerName} · {formatState(t.state)}
+                                            {/* QUAL-01: speed and ETA */}
+                                            {speedETA && (
+                                                <span style={{ marginLeft: '0.5rem', color: 'var(--text-muted)' }}>
+                                                    · {speedETA.speed} · {speedETA.eta} left
+                                                </span>
+                                            )}
                                         </div>
+                                        {t.state === 'error' && t.errorMessage && (
+                                            <div style={{ fontSize: '0.75rem', color: '#e74c3c', marginTop: '2px' }}>
+                                                {t.errorMessage}
+                                            </div>
+                                        )}
                                         {t.state === 'transferring' && (
                                             <div className="progress-bar-wrapper">
                                                 <ProgressBar percent={pct} />

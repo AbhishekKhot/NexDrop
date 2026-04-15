@@ -2,30 +2,29 @@
  * webrtc.ts
  * WebRTC DataChannel wrapper for remote P2P file transfer.
  *
- * Flow:
- *  Sender:   createOffer() → get localDescription → send via signaling →
- *            receive remoteDescription + ICE → DataChannel opens → stream chunks
- *  Receiver: receive offer → createAnswer() → send via signaling →
- *            receive ICE → DataChannel opens → receive chunks
- *
- * Note: The signaling server only relays SDP and ICE candidates.
- *       File bytes NEVER touch the signaling server.
+ * Fixes applied:
+ *  MEM-03 — Null out all event handlers in close() to prevent stale callbacks
+ *            and listener accumulation across reconnect cycles
  */
 
 function buildIceServers(): RTCIceServer[] {
   const stunList = (
-    import.meta.env.VITE_STUN_SERVERS ||
+    (import.meta as unknown as { env: Record<string, string> }).env
+      .VITE_STUN_SERVERS ||
     "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
   )
     .split(",")
-    .map((url: string) => ({ urls: url.trim() }));
+    .map((url: string): RTCIceServer => ({ urls: url.trim() }));
 
-  const turnUrl = import.meta.env.VITE_TURN_SERVER_URL as string | undefined;
+  const turnUrl = (import.meta as unknown as { env: Record<string, string> })
+    .env.VITE_TURN_SERVER_URL as string | undefined;
   if (turnUrl) {
     stunList.push({
       urls: turnUrl,
-      username: import.meta.env.VITE_TURN_USERNAME as string | undefined,
-      credential: import.meta.env.VITE_TURN_CREDENTIAL as string | undefined,
+      username: (import.meta as unknown as { env: Record<string, string> }).env
+        .VITE_TURN_USERNAME as string | undefined,
+      credential: (import.meta as unknown as { env: Record<string, string> })
+        .env.VITE_TURN_CREDENTIAL as string | undefined,
     });
   }
 
@@ -47,7 +46,7 @@ export class P2PConnection {
 
   constructor(config: RTCConfiguration = STUN_SERVERS) {
     this.pc = new RTCPeerConnection(config);
-    this._setupIceCandidateLogging();
+    this._setupConnectionLogging();
   }
 
   /** Called on sender side — creates the DataChannel and offer */
@@ -105,19 +104,18 @@ export class P2PConnection {
       throw new Error("DataChannel not open");
     }
 
-    // Wait if the buffer is full (MAX threshold e.g., 1MB)
     const MAX_BUFFER = 1024 * 1024;
     if (this.dataChannel.bufferedAmount > MAX_BUFFER) {
       await new Promise<void>((resolve) => {
         if (!this.dataChannel) return resolve();
-        
+
         const handler = () => {
           if (this.dataChannel) {
-            this.dataChannel.removeEventListener('bufferedamountlow', handler);
+            this.dataChannel.removeEventListener("bufferedamountlow", handler);
           }
           resolve();
         };
-        this.dataChannel.addEventListener('bufferedamountlow', handler);
+        this.dataChannel.addEventListener("bufferedamountlow", handler);
       });
     }
 
@@ -125,11 +123,7 @@ export class P2PConnection {
       throw new Error("DataChannel closed during wait");
     }
 
-    if (typeof data === "string") {
-      this.dataChannel.send(data);
-    } else {
-      this.dataChannel.send(data);
-    }
+    this.dataChannel.send(data as ArrayBuffer & string);
   }
 
   onData(handler: DataChannelMessageHandler): void {
@@ -140,8 +134,27 @@ export class P2PConnection {
     this.onStateHandler = handler;
   }
 
+  /** MEM-03: null out all event handlers to prevent stale callbacks */
   close(): void {
-    this.dataChannel?.close();
+    // Null out DataChannel handlers
+    if (this.dataChannel) {
+      this.dataChannel.onopen = null;
+      this.dataChannel.onclose = null;
+      this.dataChannel.onmessage = null;
+      this.dataChannel.onerror = null;
+      this.dataChannel.close();
+      this.dataChannel = null;
+    }
+
+    // Null out PeerConnection handlers
+    this.pc.onicecandidate = null;
+    this.pc.onconnectionstatechange = null;
+    this.pc.oniceconnectionstatechange = null;
+    this.pc.ondatachannel = null;
+
+    this.onDataHandler = undefined;
+    this.onStateHandler = undefined;
+
     this.pc.close();
   }
 
@@ -157,9 +170,12 @@ export class P2PConnection {
     channel.onmessage = (event: MessageEvent<ArrayBuffer | string>) => {
       this.onDataHandler?.(event.data);
     };
+    channel.onerror = (err) => {
+      console.error("[WebRTC] DataChannel error:", err);
+    };
   }
 
-  private _setupIceCandidateLogging(): void {
+  private _setupConnectionLogging(): void {
     this.pc.onconnectionstatechange = () => {
       console.log("[WebRTC] Connection state:", this.pc.connectionState);
     };

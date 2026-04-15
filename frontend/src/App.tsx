@@ -1,15 +1,28 @@
+/**
+ * App.tsx
+ *
+ * Fixes applied:
+ *  ERR-05 — ToastProvider wraps the app; agent errors surface via useToast
+ *  QUAL-05 — agentFailed banner shown when max reconnect attempts exhausted
+ */
+
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { useEffect } from 'react';
 import Home from './pages/Home';
 import Lan from './pages/Lan';
 import Remote from './pages/Remote';
 import { useAgentSocket } from './hooks/useAgentSocket';
 import IncomingTransferModal from './components/IncomingTransferModal';
+import { ToastProvider, useToast } from './lib/toast';
 
 function AppShell() {
   const location = useLocation();
+  const { addToast } = useToast();
   const {
     connected,
+    agentFailed,
     deviceName,
+    lastError,
     incomingTransfer,
     transfers,
     sendFile,
@@ -20,12 +33,29 @@ function AppShell() {
     dismissIncoming,
   } = useAgentSocket();
 
+  // ERR-05: surface agent errors as toasts
+  useEffect(() => {
+    if (lastError) {
+      addToast(lastError, 'error');
+    }
+  }, [lastError, addToast]);
+
+  // QUAL-05: surface connection failure
+  useEffect(() => {
+    if (agentFailed) {
+      addToast(
+        'Lost connection to the agent. Reload the page or restart `npm run dev` in the backend.',
+        'error',
+      );
+    }
+  }, [agentFailed, addToast]);
+
   return (
     <div className="app">
       <nav className="navbar">
         <Link to="/" className="navbar-brand" style={{ textDecoration: 'none' }}>
           <span className="logo-dot" />
-          <span>PeerDrop</span>
+          <span>NexDrop</span>
         </Link>
 
         <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'center' }}>
@@ -46,10 +76,37 @@ function AppShell() {
         </div>
 
         <div className="navbar-status">
-          <span className={`status-dot ${connected ? 'connected' : ''}`} />
-          <span>{connected ? deviceName || 'Online' : 'Offline'}</span>
+          <span className={`status-dot ${connected ? 'connected' : agentFailed ? 'failed' : ''}`} />
+          <span>
+            {connected
+              ? deviceName || 'Online'
+              : agentFailed
+              ? 'Agent unreachable'
+              : 'Offline'}
+          </span>
         </div>
       </nav>
+
+      {/* QUAL-05: persistent banner when agent connection is permanently lost */}
+      {agentFailed && (
+        <div
+          style={{
+            background: '#2d1a1a',
+            borderBottom: '1px solid #c0392b',
+            color: '#e74c3c',
+            padding: '0.5rem 1.5rem',
+            fontSize: '0.85rem',
+            textAlign: 'center',
+          }}
+        >
+          ✕ Cannot connect to agent — LAN mode unavailable. Restart the backend with{' '}
+          <code style={{ background: 'rgba(255,255,255,0.1)', padding: '1px 4px', borderRadius: '3px' }}>
+            cd backend && npm run dev
+          </code>{' '}
+          then reload.
+        </div>
+      )}
+
       <main className="main-content">
         <Routes>
           <Route path="/" element={<Home />} />
@@ -60,6 +117,7 @@ function AppShell() {
                 peers={peers.filter((p) => p.mode === 'lan')}
                 transfers={transfers}
                 agentConnected={connected}
+                agentFailed={agentFailed}
                 onSendFile={sendFile}
                 onDiscover={discoverPeers}
               />
@@ -93,7 +151,9 @@ function AppShell() {
 export default function App() {
   return (
     <BrowserRouter>
-      <AppShell />
+      <ToastProvider>
+        <AppShell />
+      </ToastProvider>
     </BrowserRouter>
   );
 }

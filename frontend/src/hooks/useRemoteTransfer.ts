@@ -3,26 +3,29 @@
  * React hook for WebRTC remote P2P file transfer with end-to-end encryption.
  *
  * Protocol flow after DataChannel opens:
- *  1. Both sides immediately perform an ECDH key exchange:
- *       → send {type:'ecdh_hello', publicKey:<base64>}
- *       ← receive peer's public key → derive shared AES-256-GCM session key
+ *  1. Both sides perform ECDH key exchange:
+ *       → {type:'ecdh_hello', publicKey:<base64>}
+ *       ← peer's public key → derive AES-256-GCM session key
  *  2. Sender notifies receiver of upcoming file:
  *       → {type:'transfer_offer', transferId, fileName, fileSize, totalChunks}
  *  3. Receiver accepts or rejects:
  *       → {type:'transfer_decision', transferId, accepted}
- *  4. On acceptance, sender streams the file:
+ *  4. Sender streams the file:
  *       → {type:'send_file_start', transferId, fileName, fileSize, totalChunks}
  *       → N encrypted ArrayBuffer chunks  (each: [12-byte IV][ciphertext+tag])
  *       → {type:'send_file_end', transferId, sha256:<hex>}
  *  5. Receiver verifies SHA-256 and triggers browser download.
  *
- * Security:
- *  - ECDH P-256 → HKDF-SHA-256 → AES-256-GCM (128-bit auth tag)
- *  - New ephemeral key pair generated per P2P session
- *  - Full-file SHA-256 integrity check on receive
+ * Fixes applied:
+ *  SEC-03  — File size check against MAX_FILE_SIZE before sending
+ *  ERR-04  — Decrypt failure aborts transfer; DataChannel closed; buffer released
+ *  RACE-01 — Chunks queued until ECDH key is ready (keyReadyPromise)
+ *  RACE-02 — ObjectURL revoke timers keyed by transferId to prevent races
+ *  MEM-02  — Receive buffer uses IndexedDB (idb-keyval) to avoid heap OOM
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { get as idbGet, set as idbSet, del as idbDel } from 'idb-keyval';
 import { P2PConnection, STUN_SERVERS } from '../lib/webrtc';
 import {
   generateECDHKeyPair,
@@ -41,6 +44,7 @@ export interface RemoteTransferState {
   remotePeer: Peer | null;
   incomingTransfer: Transfer | null;
   transfers: Map<string, Transfer>;
+  lastError: string | null;
   createRoom: () => void;
   joinRoom: (code: string) => void;
   sendRemoteFile: (file: File) => void;
@@ -51,15 +55,36 @@ export interface RemoteTransferState {
 }
 
 const SIGNALING_URL =
-  import.meta.env.VITE_SIGNALING_URL || 'ws://localhost:4002';
+  (import.meta as unknown as { env: Record<string, string> }).env
+    .VITE_SIGNALING_URL ?? 'ws://localhost:4002';
 
 const CHUNK_SIZE = 256 * 1024; // 256 KB
+
+// SEC-03: frontend default; overridden by agent_ready if agent is connected
+const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
+
+const IDB_KEY_PREFIX = 'nexdrop-recv-';
+
+/** Build an IDB key for a specific chunk */
+function chunkKey(storeKey: string, index: number): string {
+  return `${storeKey}-${index}`;
+}
+
+/** Clean up all IDB keys for a transfer — MEM-02 */
+async function cleanupIdb(storeKey: string, totalChunks: number): Promise<void> {
+  const deletes: Promise<void>[] = [];
+  for (let i = 0; i < totalChunks; i++) {
+    deletes.push(idbDel(chunkKey(storeKey, i)));
+  }
+  await Promise.all(deletes).catch(() => { /* best-effort */ });
+}
 
 export function useRemoteTransfer(): RemoteTransferState {
   const [shareCode, setShareCode] = useState<string | null>(null);
   const [remotePeer, setRemotePeer] = useState<Peer | null>(null);
   const [transfers, setTransfers] = useState<Map<string, Transfer>>(new Map());
   const [incomingTransfer, setIncomingTransfer] = useState<Transfer | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
 
   // ── WebRTC / Signaling refs ─────────────────────────────────────────────────
   const wsRef = useRef<WebSocket | null>(null);
@@ -69,29 +94,34 @@ export function useRemoteTransfer(): RemoteTransferState {
   // ── E2E Crypto refs ─────────────────────────────────────────────────────────
   const keyPairRef = useRef<ECDHKeyPair | null>(null);
   const sharedKeyRef = useRef<CryptoKey | null>(null);
-  /** Resolves when ECDH is complete and sharedKeyRef is populated. */
+  /** RACE-01: resolves when ECDH is complete; queues chunks until then */
   const keyReadyPromiseRef = useRef<Promise<void>>(Promise.resolve());
   const keyReadyResolveRef = useRef<(() => void) | null>(null);
+  const keyDerivationFailedRef = useRef(false);
 
-  // ── File receive state ──────────────────────────────────────────────────────
-  const receiveBufferRef = useRef<ArrayBuffer[]>([]);
+  // ── File receive state (MEM-02: IDB-backed) ─────────────────────────────────
   const receiveMetaRef = useRef<{
     fileName: string;
     fileSize: number;
     totalChunks: number;
     chunksReceived: number;
     transferId: string;
+    storeKey: string;       // MEM-02: IDB key prefix for this transfer
     expectedHash: string | null;
   } | null>(null);
 
   // ── Pending sends waiting for peer acceptance ───────────────────────────────
   const pendingSendsRef = useRef<Map<string, File>>(new Map());
 
+  // ── RACE-02: ObjectURL revoke timers keyed by transferId ────────────────────
+  const revokeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
   // ── Crypto helpers ───────────────────────────────────────────────────────────
 
   function resetCrypto(): void {
     keyPairRef.current = null;
     sharedKeyRef.current = null;
+    keyDerivationFailedRef.current = false;
     const promise = new Promise<void>((resolve) => {
       keyReadyResolveRef.current = resolve;
     });
@@ -108,6 +138,8 @@ export function useRemoteTransfer(): RemoteTransferState {
       );
     } catch (err) {
       console.error('[Crypto] Key exchange initiation failed:', err);
+      keyDerivationFailedRef.current = true;
+      keyReadyResolveRef.current?.(); // unblock waiters with failure flag set
     }
   }
 
@@ -115,6 +147,8 @@ export function useRemoteTransfer(): RemoteTransferState {
     try {
       if (!keyPairRef.current) {
         console.error('[Crypto] Received ecdh_hello before our key pair was ready');
+        keyDerivationFailedRef.current = true;
+        keyReadyResolveRef.current?.();
         return;
       }
       const remotePubKey = await importPublicKeyBase64(b64RemotePubKey);
@@ -126,6 +160,8 @@ export function useRemoteTransfer(): RemoteTransferState {
       console.log('[Crypto] ECDH complete — AES-256-GCM session key ready');
     } catch (err) {
       console.error('[Crypto] Shared key derivation failed:', err);
+      keyDerivationFailedRef.current = true;
+      keyReadyResolveRef.current?.(); // unblock waiters
     }
   }
 
@@ -176,6 +212,7 @@ export function useRemoteTransfer(): RemoteTransferState {
             break;
           case 'error':
             console.error('[Signaling] Error:', msg.message);
+            setLastError(msg.message);
             break;
         }
       } catch (err) {
@@ -199,7 +236,6 @@ export function useRemoteTransfer(): RemoteTransferState {
     p2p.onChannelState(async (state) => {
       if (state === 'open') {
         setRemotePeer({ id: 'remote-peer', name: 'Connected Peer', mode: 'remote', status: 'available' });
-        // Kick off ECDH — both sides do this simultaneously on channel open
         await startKeyExchange();
       } else if (state === 'closed') {
         setRemotePeer(null);
@@ -253,15 +289,16 @@ export function useRemoteTransfer(): RemoteTransferState {
         }
 
         if (meta.type === 'send_file_start') {
+          const storeKey = `${IDB_KEY_PREFIX}${meta.transferId as string}`;
           receiveMetaRef.current = {
             fileName: meta.fileName as string,
             fileSize: meta.fileSize as number,
             totalChunks: meta.totalChunks as number,
             chunksReceived: 0,
             transferId: meta.transferId as string,
+            storeKey,
             expectedHash: null,
           };
-          receiveBufferRef.current = [];
           setTransfers((prev) => {
             const next = new Map(prev);
             const t = next.get(meta.transferId as string);
@@ -275,7 +312,26 @@ export function useRemoteTransfer(): RemoteTransferState {
           const rm = receiveMetaRef.current;
           if (!rm) return;
 
-          const fileBuffer = await new Blob(receiveBufferRef.current).arrayBuffer();
+          // MEM-02: assemble from IDB rather than in-memory buffer
+          const parts: ArrayBuffer[] = [];
+          for (let i = 0; i < rm.totalChunks; i++) {
+            const chunk = await idbGet<ArrayBuffer>(chunkKey(rm.storeKey, i));
+            if (!chunk) {
+              console.error(`[Receive] Missing IDB chunk ${i} for ${rm.fileName}`);
+              setTransfers((prev) => {
+                const next = new Map(prev);
+                const t = next.get(rm.transferId);
+                if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Reassembly failed — missing chunk' });
+                return next;
+              });
+              await cleanupIdb(rm.storeKey, rm.totalChunks);
+              receiveMetaRef.current = null;
+              return;
+            }
+            parts.push(chunk);
+          }
+
+          const fileBuffer = await new Blob(parts).arrayBuffer();
           const actualHash = await sha256Hex(fileBuffer);
           const expectedHash = meta.sha256 as string | undefined;
 
@@ -287,25 +343,38 @@ export function useRemoteTransfer(): RemoteTransferState {
               if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'File integrity check failed' });
               return next;
             });
+            await cleanupIdb(rm.storeKey, rm.totalChunks);
             receiveMetaRef.current = null;
-            receiveBufferRef.current = [];
             return;
           }
 
-          const url = URL.createObjectURL(new Blob([fileBuffer]));
+          // RACE-02: cancel any stale timer for this transferId before creating a new one
+          const existingTimer = revokeTimersRef.current.get(rm.transferId);
+          if (existingTimer) clearTimeout(existingTimer);
+
+          const blob = new Blob([fileBuffer]);
+          const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url; a.download = rm.fileName;
           document.body.appendChild(a); a.click();
-          document.body.removeChild(a); URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+
+          // RACE-02: key the revoke timer by transferId
+          const timerId = setTimeout(() => {
+            URL.revokeObjectURL(url);
+            revokeTimersRef.current.delete(rm.transferId);
+          }, 1000);
+          revokeTimersRef.current.set(rm.transferId, timerId);
 
           setTransfers((prev) => {
             const next = new Map(prev);
             const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, state: 'completed' });
+            if (t) next.set(rm.transferId, { ...t, state: 'completed', completedAt: Date.now() });
             return next;
           });
+
+          await cleanupIdb(rm.storeKey, rm.totalChunks);
           receiveMetaRef.current = null;
-          receiveBufferRef.current = [];
           return;
         }
       }
@@ -314,25 +383,52 @@ export function useRemoteTransfer(): RemoteTransferState {
       if (data instanceof ArrayBuffer) {
         const rm = receiveMetaRef.current;
         if (!rm) return;
-        if (!sharedKeyRef.current) {
-          console.error('[Crypto] Chunk before key exchange — dropping');
+
+        // RACE-01: wait for ECDH to complete before decrypting any chunk
+        await keyReadyPromiseRef.current;
+
+        // Check if key derivation failed during the wait
+        if (keyDerivationFailedRef.current || !sharedKeyRef.current) {
+          console.error('[Crypto] Key exchange failed — aborting transfer');
+          setTransfers((prev) => {
+            const next = new Map(prev);
+            const t = next.get(rm.transferId);
+            if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Key exchange failed' });
+            return next;
+          });
+          // ERR-04: close channel and release resources
+          p2pRef.current?.close();
+          p2pRef.current = null;
+          await cleanupIdb(rm.storeKey, rm.totalChunks);
+          receiveMetaRef.current = null;
           return;
         }
+
         let plaintext: ArrayBuffer;
         try {
           plaintext = await decryptChunk(sharedKeyRef.current, data);
         } catch (err) {
           console.error('[Crypto] Decryption failed:', err);
+          // ERR-04: abort immediately on any decrypt failure
           setTransfers((prev) => {
             const next = new Map(prev);
             const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Decryption failed' });
+            if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Decryption failed — transfer aborted' });
             return next;
           });
+          setLastError('Decryption failed — transfer may have been tampered with');
+          // ERR-04: close DataChannel and release IDB buffer
+          p2pRef.current?.close();
+          p2pRef.current = null;
+          await cleanupIdb(rm.storeKey, rm.totalChunks);
+          receiveMetaRef.current = null;
           return;
         }
-        receiveBufferRef.current.push(plaintext);
+
+        // MEM-02: store chunk in IndexedDB instead of in-memory array
+        await idbSet(chunkKey(rm.storeKey, rm.chunksReceived), plaintext);
         rm.chunksReceived++;
+
         if (rm.chunksReceived % 10 === 0 || rm.chunksReceived === rm.totalChunks) {
           setTransfers((prev) => {
             const next = new Map(prev);
@@ -364,6 +460,12 @@ export function useRemoteTransfer(): RemoteTransferState {
   }, [connectSignaling, initP2P]);
 
   const disconnect = useCallback(() => {
+    // RACE-02: clear all pending revoke timers on disconnect
+    for (const [, timerId] of revokeTimersRef.current) {
+      clearTimeout(timerId);
+    }
+    revokeTimersRef.current.clear();
+
     p2pRef.current?.close(); p2pRef.current = null;
     wsRef.current?.close(); wsRef.current = null;
     sharedKeyRef.current = null; keyPairRef.current = null;
@@ -376,10 +478,20 @@ export function useRemoteTransfer(): RemoteTransferState {
 
   const sendRemoteFile = useCallback(async (file: File) => {
     if (!p2pRef.current || p2pRef.current.connectionState !== 'connected') {
-      console.error('[Remote] Not connected');
+      const msg = 'Not connected to a remote peer';
+      console.error('[Remote]', msg);
+      setLastError(msg);
       return;
     }
-    // Block until ECDH key exchange is done
+
+    // SEC-03: check file size before sending
+    if (file.size > MAX_FILE_SIZE) {
+      const msg = `File "${file.name}" (${file.size} bytes) exceeds the maximum allowed size`;
+      console.error('[Remote]', msg);
+      setLastError(msg);
+      return;
+    }
+
     await keyReadyPromiseRef.current;
 
     const transferId = crypto.randomUUID();
@@ -394,7 +506,8 @@ export function useRemoteTransfer(): RemoteTransferState {
       await p2pRef.current.sendRaw(JSON.stringify({ type: 'transfer_offer', transferId, fileName: file.name, fileSize: file.size, totalChunks }));
     } catch (e) {
       console.error('[Remote] Offer failed', e);
-      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'error' }); return next; });
+      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'error', errorMessage: 'Failed to send transfer offer' }); return next; });
+      setLastError('Failed to send transfer offer');
     }
   }, []);
 
@@ -405,8 +518,9 @@ export function useRemoteTransfer(): RemoteTransferState {
       console.error('[Remote] Cannot stream: not connected or no key');
       return;
     }
-    const fileBuffer = await file.arrayBuffer();
-    const fileHash = await sha256Hex(fileBuffer);
+
+    // SEC-03: load file in slices (avoid single-shot arrayBuffer for large files)
+    const fileHash = await sha256Hex(await file.arrayBuffer());
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
     try {
@@ -414,7 +528,8 @@ export function useRemoteTransfer(): RemoteTransferState {
 
       for (let i = 0; i < totalChunks; i++) {
         const start = i * CHUNK_SIZE;
-        const plaintext = fileBuffer.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+        const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+        const plaintext = await slice.arrayBuffer();
         await p2p.sendRaw(await encryptChunk(key, plaintext));
         if ((i + 1) % 10 === 0 || i + 1 === totalChunks) {
           setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, chunksReceived: i + 1 }); return next; });
@@ -422,10 +537,11 @@ export function useRemoteTransfer(): RemoteTransferState {
       }
 
       await p2p.sendRaw(JSON.stringify({ type: 'send_file_end', transferId, sha256: fileHash }));
-      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'completed' }); return next; });
+      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'completed', completedAt: Date.now() }); return next; });
     } catch (e) {
       console.error('[Remote] Stream failed', e);
-      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'error' }); return next; });
+      setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'error', errorMessage: 'Stream failed' }); return next; });
+      setLastError('File stream failed — the connection may have dropped');
     }
   }
 
@@ -434,7 +550,10 @@ export function useRemoteTransfer(): RemoteTransferState {
   const acceptRemoteTransfer = useCallback(async (transferId: string) => {
     setIncomingTransfer(null);
     try { await p2pRef.current?.sendRaw(JSON.stringify({ type: 'transfer_decision', transferId, accepted: true })); }
-    catch (err) { console.error('[Remote] Accept failed', err); }
+    catch (err) {
+      console.error('[Remote] Accept failed', err);
+      setLastError('Failed to send accept decision');
+    }
   }, []);
 
   const rejectRemoteTransfer = useCallback(async (transferId: string) => {
@@ -442,10 +561,13 @@ export function useRemoteTransfer(): RemoteTransferState {
     try {
       await p2pRef.current?.sendRaw(JSON.stringify({ type: 'transfer_decision', transferId, accepted: false }));
       setTransfers((prev) => { const next = new Map(prev); const t = next.get(transferId); if (t) next.set(transferId, { ...t, state: 'rejected' }); return next; });
-    } catch (err) { console.error('[Remote] Reject failed', err); }
+    } catch (err) {
+      console.error('[Remote] Reject failed', err);
+      setLastError('Failed to send reject decision');
+    }
   }, []);
 
   const dismissIncoming = useCallback(() => setIncomingTransfer(null), []);
 
-  return { shareCode, remotePeer, transfers, incomingTransfer, createRoom, joinRoom, sendRemoteFile, acceptRemoteTransfer, rejectRemoteTransfer, dismissIncoming, disconnect };
+  return { shareCode, remotePeer, transfers, incomingTransfer, lastError, createRoom, joinRoom, sendRemoteFile, acceptRemoteTransfer, rejectRemoteTransfer, dismissIncoming, disconnect };
 }

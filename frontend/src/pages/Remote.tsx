@@ -1,40 +1,64 @@
-import React, { useEffect } from 'react';
+/**
+ * Remote.tsx
+ *
+ * Fixes applied:
+ *  ERR-05 — Remote transfer errors surfaced via toast
+ *  QUAL-01 — Speed and ETA displayed for in-progress transfers
+ */
+
+import React, { useEffect, useRef } from 'react';
 import type { Peer, Transfer } from '../types';
 import DeviceCard from '../components/DeviceCard';
 import ProgressBar from '../components/ProgressBar';
 import IncomingTransferModal from '../components/IncomingTransferModal';
-import { formatBytes, formatState } from '../lib/utils';
+import { formatBytes, formatState, formatSpeed, formatETA } from '../lib/utils';
 import { useRemoteTransfer } from '../hooks/useRemoteTransfer';
+import { useToast } from '../lib/toast';
 
 interface RemoteProps {
-    peers?: Peer[]; // Ignoring global LAN peers for Remote mode
+    peers?: Peer[];
     transfers?: Map<string, Transfer>;
     agentConnected?: boolean;
     onSendFile?: (peerId: string, file: File) => void;
 }
 
+interface SpeedSample {
+    lastChunks: number;
+    lastAt: number;
+    bytesPerSec: number;
+}
+
 export default function Remote(_props: RemoteProps) {
+    const { addToast } = useToast();
     const [selectedPeer, setSelectedPeer] = React.useState<Peer | null>(null);
     const [dragging, setDragging] = React.useState(false);
     const [inputShareCode, setInputShareCode] = React.useState('');
     const fileInputRef = React.useRef<HTMLInputElement>(null);
-    
-    const { 
-        shareCode: localShareCode, 
-        remotePeer, 
-        transfers, 
+    const speedSamples = useRef<Map<string, SpeedSample>>(new Map());
+
+    const {
+        shareCode: localShareCode,
+        remotePeer,
+        transfers,
         incomingTransfer,
-        createRoom, 
-        joinRoom, 
-        sendRemoteFile, 
+        lastError,
+        createRoom,
+        joinRoom,
+        sendRemoteFile,
         acceptRemoteTransfer,
         rejectRemoteTransfer,
         dismissIncoming,
-        disconnect 
+        disconnect
     } = useRemoteTransfer();
 
+    // ERR-05: surface remote transfer errors as toasts
     useEffect(() => {
-        // Auto-create room when mounting
+        if (lastError) {
+            addToast(lastError, 'error');
+        }
+    }, [lastError, addToast]);
+
+    useEffect(() => {
         createRoom();
         return () => disconnect();
     }, [createRoom, disconnect]);
@@ -52,6 +76,29 @@ export default function Remote(_props: RemoteProps) {
         const file = e.target.files?.[0];
         if (file) sendRemoteFile(file);
         e.target.value = '';
+    }
+
+    // QUAL-01: speed/ETA for transferring items
+    function getSpeedETA(t: Transfer): { speed: string; eta: string } | null {
+        if (t.state !== 'transferring' || t.totalChunks === 0) return null;
+        const chunkBytes = t.fileSize / t.totalChunks;
+        const now = Date.now();
+        let sample = speedSamples.current.get(t.id);
+        if (!sample) {
+            sample = { lastChunks: t.chunksReceived, lastAt: now, bytesPerSec: 0 };
+            speedSamples.current.set(t.id, sample);
+        } else {
+            const elapsed = (now - sample.lastAt) / 1000;
+            if (elapsed >= 1) {
+                const deltaBps = ((t.chunksReceived - sample.lastChunks) * chunkBytes) / elapsed;
+                sample.bytesPerSec = sample.bytesPerSec === 0 ? deltaBps : sample.bytesPerSec * 0.7 + deltaBps * 0.3;
+                sample.lastChunks = t.chunksReceived;
+                sample.lastAt = now;
+            }
+        }
+        if (sample.bytesPerSec === 0) return null;
+        const remaining = (t.totalChunks - t.chunksReceived) * chunkBytes;
+        return { speed: formatSpeed(sample.bytesPerSec), eta: formatETA(remaining, sample.bytesPerSec) };
     }
 
     const remotePeers = remotePeer ? [remotePeer] : [];
@@ -95,15 +142,14 @@ export default function Remote(_props: RemoteProps) {
                         id="remote-connect-btn"
                         className="btn btn-primary"
                         disabled={!inputShareCode.trim()}
-                        onClick={() => {
-                            joinRoom(inputShareCode.trim());
-                        }}
+                        onClick={() => { joinRoom(inputShareCode.trim()); }}
                     >
                         Connect
                     </button>
                 </div>
                 <p style={{ marginTop: '8px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                    Share your code with the other person: <strong style={{ color: 'var(--accent)', letterSpacing: '1px' }}>
+                    Share your code with the other person:{' '}
+                    <strong style={{ color: 'var(--accent)', letterSpacing: '1px' }}>
                         {localShareCode || 'Generating...'}
                     </strong>
                 </p>
@@ -166,12 +212,7 @@ export default function Remote(_props: RemoteProps) {
                         <span className="drop-icon">📁</span>
                         <p>Drag &amp; drop a file here, or <strong>click to browse</strong></p>
                     </div>
-                    <input
-                        ref={fileInputRef}
-                        type="file"
-                        style={{ display: 'none' }}
-                        onChange={handleFileInput}
-                    />
+                    <input ref={fileInputRef} type="file" style={{ display: 'none' }} onChange={handleFileInput} />
                 </div>
             )}
 
@@ -184,6 +225,7 @@ export default function Remote(_props: RemoteProps) {
                     <div className="transfer-list">
                         {remoteTransfers.map((t) => {
                             const pct = t.totalChunks > 0 ? Math.round((t.chunksReceived / t.totalChunks) * 100) : 0;
+                            const speedETA = getSpeedETA(t);
                             return (
                                 <div className="transfer-item" key={t.id}>
                                     <span className="transfer-icon">{t.direction === 'send' ? '⬆️' : '⬇️'}</span>
@@ -191,7 +233,17 @@ export default function Remote(_props: RemoteProps) {
                                         <div className="transfer-name">{t.fileName}</div>
                                         <div className="transfer-meta">
                                             {formatBytes(t.fileSize)} · {t.peerName} · {formatState(t.state)}
+                                            {speedETA && (
+                                                <span style={{ marginLeft: '0.5rem', color: 'var(--text-muted)' }}>
+                                                    · {speedETA.speed} · {speedETA.eta} left
+                                                </span>
+                                            )}
                                         </div>
+                                        {t.state === 'error' && t.errorMessage && (
+                                            <div style={{ fontSize: '0.75rem', color: '#e74c3c', marginTop: '2px' }}>
+                                                {t.errorMessage}
+                                            </div>
+                                        )}
                                         {t.state === 'transferring' && (
                                             <div className="progress-bar-wrapper">
                                                 <ProgressBar percent={pct} />
@@ -199,10 +251,10 @@ export default function Remote(_props: RemoteProps) {
                                         )}
                                     </div>
                                     <span className={`tag tag-${t.state === 'completed' ? 'success' : (t.state === 'error' || t.state === 'rejected') ? 'error' : t.state === 'transferring' ? 'progress' : 'pending'}`}>
-                                        {t.state === 'transferring' ? `${pct}%` 
-                                         : t.state === 'completed' ? (t.direction === 'send' ? 'Sent successfully' : 'Downloaded successfully')
-                                         : t.state === 'rejected' ? 'Rejected by peer'
-                                         : formatState(t.state)}
+                                        {t.state === 'transferring' ? `${pct}%`
+                                            : t.state === 'completed' ? (t.direction === 'send' ? 'Sent' : 'Downloaded')
+                                            : t.state === 'rejected' ? 'Rejected'
+                                            : formatState(t.state)}
                                     </span>
                                 </div>
                             );

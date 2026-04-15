@@ -1,161 +1,281 @@
-# PeerDrop Local Agent
+# NexDrop — Backend Agent
 
-This repository contains the backend agent for PeerDrop, a Peer-to-Peer file sharing application designed for seamless LAN and potential remote file transfers.
+Node.js + TypeScript agent responsible for LAN peer discovery, encrypted TCP file transfer, and WebRTC signaling relay.
 
-## System Level Design (HLD)
+---
 
-### 1. LAN File Transfer Flow (Current)
+## Table of Contents
 
-This is the active mode when two devices are on the same local network (Wi-Fi). The browser communicates with its own local agent, which then communicates directly with the destination agent via TCP.
+- [Prerequisites](#prerequisites)
+- [Local Setup](#local-setup)
+- [Environment Variables](#environment-variables)
+- [Port Reference](#port-reference)
+- [Source Layout](#source-layout)
+- [LAN Transfer Protocol](#lan-transfer-protocol)
+  - [1. Startup](#1-startup)
+  - [2. Peer Discovery](#2-peer-discovery)
+  - [3. File Send Flow (Sender Side)](#3-file-send-flow-sender-side)
+  - [4. File Receive Flow (Receiver Side)](#4-file-receive-flow-receiver-side)
+  - [5. Accept / Reject Decision](#5-accept--reject-decision)
+  - [6. Chunk Format](#6-chunk-format)
+- [WebSocket API Messages](#websocket-api-messages)
+- [Signaling Server](#signaling-server)
+- [Using with ngrok / Tunnels](#using-with-ngrok--tunnels)
+- [Running Tests](#running-tests)
 
-```mermaid
-graph TD
-    %% Browser to Agent
-    UI[Browser Frontend] <-->|WebSocket localhost:4001| WS[WS API Server]
+---
 
-    %% Agent A Internal
-    subgraph Agent A
-        WS
-        MDNS[mDNS Discovery]
-        TCP_C[TCP Client Sender]
-        TCP_S[TCP Server :4000]
-    end
+## Prerequisites
 
-    %% Agent B Internal
-    subgraph Agent B
-        MDNS_B[mDNS Discovery]
-        TCP_S_B[TCP Server :4000]
-    end
+- Node.js 18 or higher
+- npm 9+
 
-    %% Agent to Agent communication
-    WS <-->|Triggers| MDNS
-    MDNS <-->|UDP Multicast| MDNS_B
-    TCP_C --->|Direct TCP Socket Connection| TCP_S_B
+---
+
+## Local Setup
+
+```bash
+# From the backend directory
+cd backend
+
+# Install dependencies
+npm install
+
+# Copy and edit environment variables (optional for local dev)
+cp .env.example .env
+
+# Start development server (nodemon + ts-node)
+npm run dev
 ```
 
-### 2. Remote File Transfer Flow (Future)
+On startup, the console prints your device name, LAN IP, and the bound ports. The agent is ready when you see:
 
-When devices are not on the same network, direct TCP connections are not easily possible. A WebRTC signaling server acts as a relay to exchange connection candidates (ICE/SDP) so the WebRTC layer in the browser/client can establish a direct data channel.
+```
+[NexDrop] Agent ready — device: MyMacBook, TCP: 4000, WS: 4001, Signaling: 4002
+```
 
-```mermaid
-graph TD
-    %% Browser to Agent
-    UI[Browser Frontend] <-->|WebSocket localhost:4001| WS[WS API Server]
+To compile and run production build:
 
-    %% Agent A Internal
-    subgraph Agent A
-        WS
-        SIG_S[Signaling Server :4002]
-        RTC_A[WebRTC Context]
-    end
-
-    %% Agent B Internal
-    subgraph Agent B
-        RTC_B[WebRTC Context]
-    end
-
-    %% Remote connections
-    UI <-->|SDP/ICE messages via WS| SIG_S
-    SIG_S <-->|Relays Signaling Messages| RTC_B
-    RTC_A <-->|Direct WebRTC P2P Data Channel| RTC_B
+```bash
+npm run build   # tsc → dist/
+node dist/index.js
 ```
 
 ---
 
-## Detailed Data & Request Flow (LAN Transfer)
+## Environment Variables
 
-### 1. Application Startup & Frontend Initialization
+Copy `.env.example` to `.env` and override any value you need. All variables have safe defaults for local development.
 
-- **Backend Boot**: Upon running the project, `index.ts` initializes the `MdnsService` (`.advertise()` and `.browse()`), spins up the WebSocket API `WsApiServer` on port `4001`, starts the `TCP Server` on port `4000`, and the `Signaling Server` on port `4002`.
-- **Frontend Connects**: The user opens the web frontend, which instantly attempts to establish a WebSocket (`ws://`) connection to the local agent at `localhost:4001`.
-- **WS Upgrade Authentication**: The agent HTTP server intercepts the upgrade. By default, it verifies the remote IP is `127.0.0.1`. (If `ALLOW_REMOTE_WS=true` is set, external IPs via reverse proxies like ngrok are allowed).
-- **Agent Ready**: On a successful WebSocket connection, the backend immediately emits a JSON `{ type: "agent_ready" }` event containing the device name and agent ID down to the frontend.
-- **Peer Discovery**: The frontend can explicitly request a list of peers using the `discover_peers` WS message. The backend uses mDNS to scan the local network and responds with a broadcast `{ type: "peers_update" }` containing all discovered peer IPS and ports.
-
-### 2. Device and File Chosen
-
-When User A selects a file and clicks "Send" targeting User B:
-
-1. **Frontend Streams File to Backend**:
-   - Frontend sends a setup JSON frame: `{ type: "send_file_start", peerId, fileName, totalChunks, ... }` to the local WS API.
-   - The frontend reads the local file, splits it into chunks, and streams binary WS frames sequentially. Each frame is prefixed with a 4-byte chunk index.
-   - The frontend sends a completion JSON frame: `{ type: "send_file_end", peerId, fileName }`.
-2. **Backend Assembles**:
-   - During streaming, `WsApiServer` continuously buffers these binary payloads in memory.
-   - Upon receiving `send_file_end`, it concatenates the chunks into a final full `Buffer` object.
-   - The WS Server then triggers the internal `onSendFile` callback, passing the file buffer to the `TCP Client` sender mechanism (`sendFileToPeer`).
-
-### 3. Direct P2P Network Transfer Initialization
-
-1. **TCP Connection**: Agent A (`TCP Client`) opens a raw TCP socket connection pointing directly to Agent B's discovered LAN IP on port `4000`.
-2. **Key Exchange (ECDH)**: Agent B's TCP server immediately sends its ephemeral ECDH public key over the socket. Agent A derives a strong secure session key from it.
-3. **Metadata Frame**: Agent A sends a newline-delimited JSON `METADATA` frame (containing the `transferId`, `fileName`, file hash, and its own public key) to Agent B.
-
-### 4. Transfer Acceptance / Rejection
-
-Upon receiving the `METADATA` frame, Agent B's `TCP Server`:
-
-1. **Notifies Frontend**: Triggers the `onOffer` callback. `WsApiServer` broadcasts `{ type: "transfer_offer", transfer }` down to User B's browser, triggering a UI modal.
-2. **Pending State**: The TCP server pauses execution, registering a promise in a `PendingDecisionMap` with a hard timeout of 60 seconds.
-3. **User Action**:
-   - **If User B Rejects**: Frontend sends `{ type: "reject_transfer", transferId }` via WS. The `TCP Server` resolves the map, writes a `REJECT` JSON frame to Agent A over the socket, and destroys the connection. Agent A updates its UI to show "Rejected".
-   - **If User B Accepts**: Frontend sends `{ type: "accept_transfer", transferId }`. The `TCP Server` resolves the map, writes an `ACCEPT` JSON frame to Agent A, and prepares to read file chunks.
-
-### 5. Transfer Execution & File Writing
-
-If the transfer is accepted:
-
-1. **Chunking & Encryption**: Agent A's `TCP Client` splits the memory file buffer into 256KB segments. Each segment is strictly encrypted using AES-256-GCM.
-2. **Streaming**: Agent A writes stringified `CHUNK` frames containing the JSON payload: `index`, AES IV, AES AuthTag, and Base64-encoded encrypted chunk data. Backpressure is managed automatically by respecting Node.js `.write()` drain events.
-3. **Real-time Progress**: As pieces flow over the socket and get decrypted/verified, both Agents A and B emit continuous `transfer_update` messages to their respective browser WS connections to update UI progress bars.
-4. **Finalization**:
-   - Agent A finally sends a `DONE` frame indicating the end of the file.
-   - Agent B reassembles all verified raw chunks into a single file buffer, matches the master SHA-256 hash against the original metadata, and writes the output to the root `<ProjectDir>/downloads` directory.
-   - The TCP connection is closed safely, and both frontends reflect a "Completed" status.
+| Variable | Default | Description |
+|---|---|---|
+| `TCP_PORT` | `4000` | Port the TCP server listens on for incoming LAN transfers |
+| `WS_API_PORT` | `4001` | Port the WebSocket API server binds to |
+| `SIGNALING_PORT` | `4002` | Port the WebRTC signaling relay binds to |
+| `DEVICE_NAME` | `os.hostname()` | Display name broadcast via mDNS |
+| `DOWNLOAD_DIR` | `~/Downloads/NexDrop` | Directory where received files are written |
+| `ALLOW_REMOTE_WS` | `false` | Set to `true` to accept non-localhost WS connections (ngrok, Caddy proxy) |
+| `WS_ALLOWED_ORIGIN` | `http://localhost:5173` | `Origin` header allowed on WS upgrade (CORS) |
+| `MAX_CHUNK_SIZE` | `262144` | Chunk size in bytes (must match frontend `CHUNK_SIZE`) |
+| `SIGNALING_MAX_CONN_PER_IP` | `5` | Max simultaneous WebSocket connections per IP on signaling |
+| `SIGNALING_MAX_MSG_PER_SEC` | `20` | Max signaling messages per second per connection |
+| `SIGNALING_ROOM_TTL_MS` | `600000` | How long a room waits for a second peer before expiring (ms) |
 
 ---
 
-## User Setup Guide
+## Port Reference
 
-### Prerequisites
+| Port | Protocol | Purpose |
+|---|---|---|
+| 4000 | TCP | Receive encrypted LAN file transfers |
+| 4001 | WebSocket | Browser ↔ agent API bridge |
+| 4002 | WebSocket | WebRTC signaling relay (SDP/ICE only) |
 
-- [Node.js](https://nodejs.org/) (Version 18 or higher recommended)
-- `npm` (comes with Node.js)
-- Optionally: TypeScript compiler `tsc` installed globally.
+---
 
-### Installation & Execution
+## Source Layout
 
-1. Open a terminal and navigate to the project directory:
-   ```bash
-   cd /path/to/PeerDrop-Backend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Run the development server:
-   ```bash
-   npm run dev
-   ```
+```
+src/
+├── index.ts                 Entry point — wires all services together
+├── config.ts                Centralized env-var config with defaults
+├── types.ts                 Shared TypeScript types (Peer, Transfer, Chunk…)
+├── api/
+│   └── wsApi.ts             HTTP server + WebSocket upgrade handler
+├── chunking/
+│   ├── chunker.ts           Split a file Buffer into encrypted Chunk[]
+│   └── assembler.ts         Verify + decrypt Chunk[] → file Buffer
+├── crypto/
+│   └── aesGcm.ts            ECDH P-256, AES-256-GCM, HKDF-SHA256 helpers
+├── discovery/
+│   └── mdns.ts              mDNS advertise + browse (bonjour-service)
+└── transport/
+    ├── tcpClient.ts         Open TCP connection to peer and stream file
+    ├── tcpServer.ts         Accept TCP connections, manage transfer lifecycle
+    └── signalingServer.ts   WebRTC signaling relay with rate limiting
+```
 
-Upon running, you'll see a console banner displaying your device name, LAN IP address, and successfully bound ports (4000 for transfers, 4001 for WebSocket UI).
+---
 
-### Connecting the Browser Frontend
+## LAN Transfer Protocol
 
-1. Open your browser-based frontend React application.
-2. Ensure the frontend's WebSocket configuration points to your agent at `ws://localhost:4001`.
-3. To test transfers between two machines, run the agent on both Machine A and Machine B. They must be connected to the exact same Wi-Fi router or Local Network. The applications will auto-discover each other using mDNS.
+### 1. Startup
 
-### Using with a Mobile Device (Ngrok)
+`index.ts` initialises four services in order:
 
-If you wish to use a mobile browser connecting to a desktop agent (e.g., using your phone's browser to send a file to your PC):
+1. `MdnsService` — advertises this device and browses for peers
+2. `TcpServer` — listens on `TCP_PORT` for incoming file transfers
+3. `WsApiServer` — accepts the browser's WebSocket connection
+4. `SignalingServer` — relays WebRTC SDP/ICE for Remote mode
 
-1. Start the agent with remote WebSocket connections permitted:
-   ```bash
-   ALLOW_REMOTE_WS=true npm run dev
-   ```
-2. Expose the agent's WebSocket port to the internet safely via Ngrok:
-   ```bash
-   ngrok http 4001
-   ```
-3. Access your frontend on your mobile device and paste the generated `wss://<ngrok-url>` as the WebSocket endpoint to pair it with your laptop's agent.
+### 2. Peer Discovery
+
+- The agent runs `bonjour.advertise({ type: "peerdrop", port: TCP_PORT })` on startup.
+- `bonjour.find({ type: "peerdrop" })` fires `up`/`down` events as peers appear and disappear.
+- On each change the agent broadcasts `{ type: "peers_update", peers: [...] }` to all connected browser clients.
+- The browser can also request an immediate refresh via `{ type: "discover_peers" }`.
+
+### 3. File Send Flow (Sender Side)
+
+```
+Browser                         Agent (WsApiServer)              Peer Agent (TcpServer)
+   │                                   │                                 │
+   │── WS JSON: send_file_start ───────►│                                 │
+   │   { peerId, fileName,              │                                 │
+   │     totalChunks, fileHash }        │                                 │
+   │                                   │                                 │
+   │── WS Binary: [4-byte idx][data] ──►│                                 │
+   │   (repeat for every chunk)         │ buffer chunks in memory         │
+   │                                   │                                 │
+   │── WS JSON: send_file_end ─────────►│                                 │
+   │   { peerId, fileName }             │                                 │
+   │                                   │── TCP connect ─────────────────►│
+   │                                   │── ECDH key exchange ────────────►│
+   │                                   │── METADATA frame ───────────────►│
+   │                                   │   { transferId, fileName,        │
+   │                                   │     totalChunks, fileHash,       │
+   │                                   │     senderPublicKey }            │
+```
+
+### 4. File Receive Flow (Receiver Side)
+
+```
+Peer Agent (TcpClient)          Agent (TcpServer)              Browser
+       │                               │                           │
+       │── TCP connect ───────────────►│                           │
+       │                               │── send ECDH public key ──►│ (internal)
+       │── METADATA frame ────────────►│                           │
+       │                               │── WS: transfer_offer ────►│
+       │                               │   (shows accept modal)    │
+       │    ... 60 s decision window ..│                           │
+       │                               │◄── WS: accept_transfer ───│
+       │◄── ACCEPT frame ──────────────│                           │
+       │                               │                           │
+       │── CHUNK frames ──────────────►│ decrypt + verify          │
+       │   (repeat)                    │── WS: transfer_update ───►│
+       │── DONE frame ────────────────►│                           │
+       │                               │ verify full-file SHA-256  │
+       │                               │ write file to DOWNLOAD_DIR│
+       │                               │── WS: transfer_update ───►│
+       │                               │   (state: completed)      │
+```
+
+### 5. Accept / Reject Decision
+
+- On `METADATA` the TCP server registers a promise in `PendingDecisionMap` keyed by `transferId`.
+- The browser sends `{ type: "accept_transfer", transferId }` or `{ type: "reject_transfer", transferId }`.
+- If neither arrives within 60 seconds, the transfer is auto-rejected and the socket is closed.
+
+### 6. Chunk Format
+
+Each chunk is sent as a newline-terminated JSON string over the TCP socket:
+
+```jsonc
+// Sender → Receiver
+{ "type": "CHUNK",
+  "index": 3,
+  "iv": "<12-byte base64>",
+  "authTag": "<16-byte base64>",
+  "data": "<base64-encoded AES-256-GCM ciphertext>",
+  "hash": "<SHA-256 hex of plaintext>" }
+
+// Control frames
+{ "type": "METADATA", "transferId": "...", "fileName": "...", "totalChunks": 42, "fileHash": "...", "senderPublicKey": "..." }
+{ "type": "ACCEPT" }
+{ "type": "REJECT" }
+{ "type": "DONE" }
+```
+
+Encryption per chunk:
+1. Generate random 12-byte IV
+2. AES-256-GCM encrypt plaintext chunk → `{ ciphertext, authTag }`
+3. Compute SHA-256 of **plaintext** for integrity double-check
+4. Base64-encode ciphertext before embedding in JSON
+
+---
+
+## WebSocket API Messages
+
+The browser connects to `ws://localhost:4001`. All messages are JSON except binary file chunk frames.
+
+### Browser → Agent
+
+| `type` | Payload fields | Description |
+|---|---|---|
+| `discover_peers` | — | Request immediate mDNS scan |
+| `send_file_start` | `peerId, fileName, totalChunks, fileHash` | Begin streaming a file |
+| _(binary frame)_ | `[4-byte big-endian chunk index][raw bytes]` | One 256 KB chunk |
+| `send_file_end` | `peerId, fileName` | Mark stream complete |
+| `accept_transfer` | `transferId` | Accept an incoming transfer |
+| `reject_transfer` | `transferId` | Reject an incoming transfer |
+
+### Agent → Browser
+
+| `type` | Payload fields | Description |
+|---|---|---|
+| `agent_ready` | `deviceName, agentId` | Sent immediately on WS connect |
+| `peers_update` | `peers: Peer[]` | Current mDNS peer list |
+| `transfer_offer` | `transfer: Transfer` | Incoming file — triggers modal |
+| `transfer_update` | `transfer: Transfer` | Progress or state change |
+
+---
+
+## Signaling Server
+
+The signaling server (`src/transport/signalingServer.ts`) is a lightweight WebSocket relay on port `4002`.
+
+- **Room lifecycle**: Browser A creates a room → gets an 8-char code → shares it → Browser B joins → server relays SDP/ICE between them → room closes when both peers disconnect.
+- **Rate limits** (configurable via env):
+  - Max 5 simultaneous connections per IP
+  - Max 20 signaling messages per second per connection
+  - Room expires after 10 minutes if only one peer has joined
+- **The server never touches file bytes** — only SDP offers/answers and ICE candidates pass through.
+
+---
+
+## Using with ngrok / Tunnels
+
+To accept a browser WebSocket connection from outside localhost (e.g., phone browser → desktop agent):
+
+```bash
+# 1. Start agent with remote WS allowed
+ALLOW_REMOTE_WS=true npm run dev
+
+# 2. Expose port 4001
+ngrok http 4001
+
+# 3. In the frontend env, set:
+VITE_AGENT_WS_URL=wss://<ngrok-subdomain>.ngrok.io
+```
+
+Set `WS_ALLOWED_ORIGIN` to match the frontend origin to avoid CORS rejections.
+
+---
+
+## Running Tests
+
+```bash
+npm test
+```
+
+Current coverage is minimal (2 test files — signaling server smoke tests). Full unit tests for crypto and chunking are planned (see [ERRORS.md](../ERRORS.md)).

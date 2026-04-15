@@ -3,7 +3,7 @@
  * WebSocket API — bridges the browser UI and the local agent.
  *
  * Binary streaming protocol for file send:
- *  1. JSON: { type:'send_file_start', peerId, fileName, fileSize, totalChunks }
+ *  1. JSON: { type:'send_file_start', peerId, fileName, fileSize, totalChunks, chunkSize }
  *  2. N binary frames: each is [4 bytes big-endian chunk index][raw file bytes]
  *  3. JSON: { type:'send_file_end', peerId, fileName }
  *
@@ -13,16 +13,18 @@
  *
  * Security: only accepts connections from localhost (blocks remote connections).
  * For ngrok/mobile: the ngrok tunnel itself is the access-control boundary.
- *   Set ALLOW_REMOTE_WS=true to allow non-localhost (needed when agent is
- *   reached via ngrok from a mobile browser).
+ *   Set ALLOW_REMOTE_WS=true to allow non-localhost connections.
+ *
+ * Fixes applied:
+ *  ERR-02  — 60 s inactivity timer per in-progress stream; reset on each chunk
  */
 
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import type { AgentMessage, BrowserMessage, Transfer } from "../types";
-import { WS_API_PORT, DEVICE_NAME } from "../config";
+import { WS_API_PORT, DEVICE_NAME, ALLOW_REMOTE_WS, MAX_FILE_SIZE } from "../config";
 
-const ALLOW_REMOTE_WS = process.env.ALLOW_REMOTE_WS === "true";
+const STREAM_INACTIVITY_TIMEOUT_MS = 60_000; // ERR-02
 
 /** Tracks an in-progress binary stream from the browser */
 interface InboundStream {
@@ -32,6 +34,8 @@ interface InboundStream {
   totalChunks: number;
   chunks: Map<number, Buffer>; // chunkIndex → raw bytes
   receivedCount: number;
+  /** ERR-02: timer that fires if no chunk arrives within 60 s */
+  inactivityTimer: NodeJS.Timeout;
 }
 
 export class WsApiServer {
@@ -44,10 +48,13 @@ export class WsApiServer {
   onRejectTransfer?: (transferId: string) => void;
   onDiscoverPeers?: () => void;
 
-  constructor(private deviceId: string) {
+  constructor(
+    private deviceId: string,
+    private maxFileSize: number = MAX_FILE_SIZE,
+  ) {
     const httpServer = http.createServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("PeerDrop agent running");
+      res.end("NexDrop agent running");
     });
 
     this.wss = new WebSocketServer({ server: httpServer });
@@ -81,6 +88,7 @@ export class WsApiServer {
         type: "agent_ready",
         deviceName: DEVICE_NAME,
         deviceId: this.deviceId,
+        maxFileSize: this.maxFileSize,
       });
 
       ws.on("message", (raw, isBinary) => {
@@ -96,7 +104,6 @@ export class WsApiServer {
           const chunkData = buf.subarray(4);
 
           // Find the current in-progress stream for this client
-          // (there should only be one active at a time per client)
           let activeStream: InboundStream | undefined;
           for (const s of streams.values()) {
             activeStream = s;
@@ -113,7 +120,14 @@ export class WsApiServer {
           activeStream.chunks.set(chunkIndex, chunkData);
           activeStream.receivedCount++;
 
-          // Log progress every 10 chunks
+          // ERR-02: reset inactivity timer on each received chunk
+          clearTimeout(activeStream.inactivityTimer);
+          activeStream.inactivityTimer = this._makeInactivityTimer(
+            ws,
+            streams,
+            activeStream,
+          );
+
           if (
             chunkIndex % 10 === 0 ||
             activeStream.receivedCount === activeStream.totalChunks
@@ -139,6 +153,10 @@ export class WsApiServer {
 
       ws.on("close", () => {
         this.clients.delete(ws);
+        // ERR-02: clear all pending inactivity timers on disconnect
+        for (const stream of streams.values()) {
+          clearTimeout(stream.inactivityTimer);
+        }
         streams.clear();
         console.log(
           `[WS API] Client disconnected (${this.clients.size} remaining)`,
@@ -158,6 +176,26 @@ export class WsApiServer {
     });
   }
 
+  /** ERR-02: build a 60 s inactivity timer for a stream */
+  private _makeInactivityTimer(
+    ws: WebSocket,
+    streams: Map<string, InboundStream>,
+    stream: InboundStream,
+  ): NodeJS.Timeout {
+    const key = `${stream.peerId}:${stream.fileName}`;
+    return setTimeout(() => {
+      console.warn(
+        `[WS API] Stream timed out (no chunk for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000}s): ${stream.fileName}`,
+      );
+      streams.delete(key);
+      this.sendTo(ws, {
+        type: "error",
+        message: `File stream timed out — transfer for "${stream.fileName}" was incomplete`,
+        code: "STREAM_TIMEOUT",
+      });
+    }, STREAM_INACTIVITY_TIMEOUT_MS);
+  }
+
   private handleMessage(
     msg: BrowserMessage,
     ws: WebSocket,
@@ -167,18 +205,26 @@ export class WsApiServer {
       case "send_file_start": {
         const key = `${msg.peerId}:${msg.fileName}`;
         if (streams.has(key)) {
+          // Clear timer for old stream before replacing
+          clearTimeout(streams.get(key)!.inactivityTimer);
           console.warn(
             `[WS API] Stream already in progress for ${key}, resetting`,
           );
         }
-        streams.set(key, {
+
+        const stream: InboundStream = {
           peerId: msg.peerId,
           fileName: msg.fileName,
           fileSize: msg.fileSize,
           totalChunks: msg.totalChunks,
           chunks: new Map(),
           receivedCount: 0,
-        });
+          inactivityTimer: setTimeout(() => {}, 0), // placeholder; replaced immediately below
+        };
+        // ERR-02: start real inactivity timer
+        stream.inactivityTimer = this._makeInactivityTimer(ws, streams, stream);
+        streams.set(key, stream);
+
         console.log(
           `[WS API] Stream started: ${msg.fileName} → peer ${msg.peerId} (${msg.totalChunks} chunks)`,
         );
@@ -192,6 +238,9 @@ export class WsApiServer {
           console.warn(`[WS API] send_file_end but no stream found for ${key}`);
           return;
         }
+
+        // ERR-02: stream completed — clear timer
+        clearTimeout(stream.inactivityTimer);
 
         if (stream.receivedCount !== stream.totalChunks) {
           console.warn(
@@ -226,7 +275,6 @@ export class WsApiServer {
         );
         streams.delete(key);
 
-        // Hand off to TCP client (async, don't await here)
         this.onSendFile?.(stream.peerId, stream.fileName, fileBuffer);
         break;
       }
@@ -265,5 +313,10 @@ export class WsApiServer {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }
+
+  /** For use by transfer-update callbacks */
+  broadcastTransfer(transfer: Transfer): void {
+    this.broadcast({ type: "transfer_update", transfer });
   }
 }
