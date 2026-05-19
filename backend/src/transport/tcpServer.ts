@@ -40,11 +40,22 @@ import {
   MAX_FILE_SIZE,
   TCP_MAX_CONNECTIONS,
   TCP_MAX_CONN_PER_IP,
+  CHUNK_SIZE,
 } from "../config";
 import type { FileMetadata, Chunk, Transfer } from "../types";
-import { TcpFrameType } from "../types";
+import { TcpFrameType, PROTOCOL_VERSION } from "../types";
 import { computeSessionKey, generateECDHPair } from "../crypto/aesGcm";
 import { assembleChunks } from "../chunking/assembler";
+
+// SEC-09: Hard upper bound on a single frame's declared payload length.
+// CHUNK is the largest legitimate frame (CHUNK_SIZE + 12-byte IV + 16-byte tag).
+// 1024 bytes of slack accommodates implementation overhead while still blocking
+// a malicious peer from forcing the server to allocate gigabytes via a giant
+// declared length before any size check runs.
+const MAX_FRAME_PAYLOAD_BYTES = CHUNK_SIZE + 1024;
+// SEC-09: tighter cap for JSON control frames. None of the legitimate control
+// payloads (PUBLIC_KEY, METADATA, DONE, ACCEPT, REJECT) come close to 64 KB.
+const MAX_CONTROL_FRAME_BYTES = 64 * 1024;
 
 export type TransferUpdateCallback = (transfer: Transfer) => void;
 export type IncomingOfferCallback = (transfer: Transfer) => void;
@@ -266,6 +277,28 @@ export function createTcpServer(
         const typeByte = readBuf.readUInt8(0);
         const payloadLen = readBuf.readUInt32BE(1);
 
+        // SEC-09: enforce per-frame size cap BEFORE waiting for the payload.
+        // Without this, a malicious peer declaring payloadLen = 4 GB would
+        // force readBuf to grow up to that size as more 'data' events arrive,
+        // exhausting memory long before any application-level size check runs.
+        if (payloadLen > MAX_FRAME_PAYLOAD_BYTES) {
+          console.warn(
+            `[TCP Server] Frame payload too large (${payloadLen} bytes > ${MAX_FRAME_PAYLOAD_BYTES}) — closing connection from ${remoteIp}`,
+          );
+          socket.destroy();
+          return;
+        }
+        if (
+          typeByte !== TcpFrameType.CHUNK &&
+          payloadLen > MAX_CONTROL_FRAME_BYTES
+        ) {
+          console.warn(
+            `[TCP Server] Control frame too large (type=0x${typeByte.toString(16)}, ${payloadLen} bytes) — closing connection from ${remoteIp}`,
+          );
+          socket.destroy();
+          return;
+        }
+
         // Wait for the full payload to arrive before processing
         if (readBuf.length < 5 + payloadLen) break;
 
@@ -306,6 +339,25 @@ export function createTcpServer(
           }
           metadata = parsed.payload;
           transferId = metadata.transferId;
+
+          // CPU-02: reject mismatched protocol versions explicitly.
+          // The METADATA frame carries protocolVersion so that incompatible
+          // framing or crypto changes fail loudly here instead of silently
+          // corrupting data by reinterpreting unknown frame layouts.
+          if (
+            typeof metadata.protocolVersion !== "number" ||
+            metadata.protocolVersion !== PROTOCOL_VERSION
+          ) {
+            console.warn(
+              `[TCP Server] Protocol version mismatch from ${remoteIp}: peer=${metadata.protocolVersion}, ours=${PROTOCOL_VERSION}`,
+            );
+            writeControlFrame(socket, TcpFrameType.REJECT, {
+              kind: "REJECT",
+              transferId,
+            });
+            socket.destroy();
+            return;
+          }
 
           // SEC-01: reject oversized files before accepting.
           // Doing this check here (in METADATA) rather than waiting for DONE

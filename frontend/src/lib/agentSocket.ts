@@ -396,6 +396,19 @@ class AgentSocket {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
+  /**
+   * Authoritative file-size cap reported by the agent in agent_ready.
+   *
+   * Other hooks (notably useRemoteTransfer) should consult this rather than a
+   * hardcoded constant so that raising MAX_FILE_SIZE on the backend immediately
+   * tightens the browser-side guard without a coordinated frontend change.
+   *
+   * Defaults to the same 2 GB value the agent uses until agent_ready arrives.
+   */
+  get maxAcceptedFileSize(): number {
+    return this.maxFileSize;
+  }
+
   /** True after max reconnect attempts are exhausted (QUAL-05) */
   get connectionFailed(): boolean {
     return this._connectionFailed;

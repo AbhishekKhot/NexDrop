@@ -32,6 +32,11 @@ import type { Transfer, TcpControlFrame } from "../types";
 import { TcpFrameType, PROTOCOL_VERSION } from "../types";
 import { CHUNK_SIZE, MAX_FILE_SIZE, MAX_TRANSFER_BPS } from "../config";
 
+// SEC-09: server → client frames are always control frames (PUBLIC_KEY,
+// ACCEPT, REJECT) — none should exceed 64 KB. A larger declared length is
+// either a bug or a malicious peer trying to OOM the client.
+const MAX_CONTROL_FRAME_BYTES = 64 * 1024;
+
 export type TransferUpdateCallback = (transfer: Transfer) => void;
 
 // ── Frame writer helpers ──────────────────────────────────────────────────────
@@ -253,6 +258,17 @@ export async function sendFileToPeer(
       while (readBuf.length >= 5) {
         const typeByte = readBuf.readUInt8(0);
         const payloadLen = readBuf.readUInt32BE(1);
+
+        // SEC-09: server should only ever send control frames at us. A frame
+        // claiming to be larger than MAX_CONTROL_FRAME_BYTES is hostile.
+        if (payloadLen > MAX_CONTROL_FRAME_BYTES) {
+          console.warn(
+            `[TCP Client] Server frame too large (type=0x${typeByte.toString(16)}, ${payloadLen} bytes) — closing connection`,
+          );
+          socket.destroy();
+          return;
+        }
+
         if (readBuf.length < 5 + payloadLen) break;
 
         const payload = readBuf.subarray(5, 5 + payloadLen);

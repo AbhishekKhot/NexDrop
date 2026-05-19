@@ -33,7 +33,7 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import { IncomingMessage } from "http";
-import { v4 as uuidv4 } from "uuid";
+import crypto from "crypto";
 import {
   SIGNALING_PORT,
   SIGNALING_MAX_CONN_PER_IP,
@@ -44,6 +44,41 @@ import {
   SIGNALING_FAILED_JOIN_WINDOW_MS,
   ALLOW_REMOTE_WS,
 } from "../config";
+
+// ── SEC-11: Share-code generation ─────────────────────────────────────────────
+
+/**
+ * Crockford-style base32 alphabet excluding the ambiguous characters
+ *  0 (zero) ↔ O    1 (one) ↔ I, L
+ * leaving exactly 32 symbols.  32 is a power of two, so `byte & 0x1f` produces
+ * a uniformly distributed index — no modulo bias, no rejection sampling needed.
+ */
+const SHARE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; // 32 chars
+/**
+ * 10 characters × 5 bits = 50 bits of entropy ≈ 1.1×10^15 combinations.
+ *
+ * Previous implementation used `uuidv4().slice(0,8).toUpperCase()`, which only
+ * emitted hex digits [0-9A-F] for an effective key space of 16^8 ≈ 4.3×10^9 —
+ * an order of magnitude smaller than the comments claimed.  The new code is
+ * uniformly distributed across the 32-symbol alphabet via crypto.randomBytes
+ * (CSPRNG), with the per-IP failed-join cap providing brute-force resistance
+ * on top of the entropy.
+ */
+const SHARE_CODE_LENGTH = 10;
+
+/**
+ * Generate a uniformly random share code using a CSPRNG.
+ * Caller is responsible for collision-checking against the live rooms map.
+ */
+function generateShareCode(): string {
+  const bytes = crypto.randomBytes(SHARE_CODE_LENGTH);
+  let out = "";
+  for (let i = 0; i < SHARE_CODE_LENGTH; i++) {
+    // 32 symbols, mask the low 5 bits — zero modulo bias since 32 | 256
+    out += SHARE_CODE_ALPHABET[bytes[i] & 0x1f];
+  }
+  return out;
+}
 
 /**
  * A signaling room with at most 2 peers.
@@ -174,10 +209,11 @@ function untrackConnection(ip: string, ws: WebSocket): void {
  * When an IP exceeds SIGNALING_MAX_FAILED_JOINS failures within
  * SIGNALING_FAILED_JOIN_WINDOW_MS, its WebSocket is terminated.
  *
- * The 8-character uppercase share code has 36^8 ≈ 2.8 trillion combinations.
- * At 10 failures per minute this would take ~530 million years to brute-force —
- * the real purpose of this limit is to prevent abuse of the signaling server
- * as a probing tool, not to prevent cryptographic brute force.
+ * SEC-11: the share code is 10 characters drawn uniformly from a 32-symbol
+ * alphabet via CSPRNG, giving 2^50 ≈ 1.1×10^15 combinations.  Combined with
+ * the per-IP rate limit below, brute-force enumeration is computationally
+ * infeasible.  This counter mainly exists to prevent abuse of the signaling
+ * server as a probing tool for live rooms.
  */
 interface FailedJoinRecord {
   count: number;
@@ -359,9 +395,24 @@ export function createSignalingServer(): WebSocketServer {
           return;
         }
 
-        // 8-char uppercase share code — short enough to type, unique enough
-        // for our threat model (see SEC-07 comment above for collision analysis)
-        const roomId = uuidv4().slice(0, 8).toUpperCase();
+        // SEC-11: CSPRNG share code with collision check.
+        // 32-symbol alphabet × 10 chars = 50 bits of entropy.  Collisions are
+        // astronomically unlikely, but a check-and-regenerate loop bounds the
+        // worst case deterministically and prevents the previous version's
+        // silent room overwrite if a collision did occur.
+        let roomId = generateShareCode();
+        for (let attempt = 0; rooms.has(roomId) && attempt < 5; attempt++) {
+          roomId = generateShareCode();
+        }
+        if (rooms.has(roomId)) {
+          // 5 collisions in a row from a 2^50 space means RNG failure or a
+          // catastrophic number of live rooms — refuse rather than overwrite.
+          send(ws, {
+            type: "error",
+            message: "Unable to allocate a unique room ID. Try again.",
+          });
+          return;
+        }
 
         // Expiry timer: destroy room if second peer never joins
         const expiryTimer = setTimeout(() => {

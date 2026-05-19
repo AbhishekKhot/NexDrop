@@ -29,8 +29,9 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { get as idbGet, set as idbSet, del as idbDel } from 'idb-keyval';
+import { get as idbGet, set as idbSet, del as idbDel, keys as idbKeys } from 'idb-keyval';
 import { P2PConnection, STUN_SERVERS } from '../lib/webrtc';
+import { agentSocket } from '../lib/agentSocket';
 import {
   generateECDHKeyPair,
   exportPublicKeyBase64,
@@ -65,8 +66,15 @@ const SIGNALING_URL =
 
 const CHUNK_SIZE = 256 * 1024; // 256 KB — must match backend CHUNK_SIZE
 
-// SEC-03: default limit; ideally overridden by agent_ready.maxFileSize
-const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
+/**
+ * Fallback file-size cap used only if the agent has not yet reported one.
+ *
+ * SEC-03: the authoritative value is published by the agent in agent_ready
+ * and surfaced via agentSocket.maxAcceptedFileSize.  sendRemoteFile() reads
+ * that getter at call time so a backend change (e.g. raising MAX_FILE_SIZE)
+ * takes effect without any frontend redeploy.
+ */
+const FALLBACK_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /**
  * IDB key prefix for receive buffers — MEM-02.
@@ -102,6 +110,35 @@ async function cleanupIdb(storeKey: string, totalChunks: number): Promise<void> 
     deletes.push(idbDel(chunkKey(storeKey, i)));
   }
   await Promise.all(deletes).catch(() => { /* best-effort */ });
+}
+
+/**
+ * MEM-04: Garbage-collect orphaned receive chunks left over from a tab that
+ * was killed mid-receive (close button, crash, refresh).
+ *
+ * The hook is the only writer of nexdrop-recv-* keys.  On a fresh mount there
+ * is no in-flight transfer in this tab, so every key matching the prefix is
+ * orphaned and safe to drop.  Active transfers started after the sweep are
+ * unaffected because they use a freshly-randomised transferId.
+ *
+ * Errors are swallowed — IDB unavailable (private browsing on some engines,
+ * quota exceeded) must not block the hook from initialising.
+ */
+async function gcOrphanedReceiveChunks(): Promise<void> {
+  try {
+    const allKeys = await idbKeys();
+    const orphaned: string[] = [];
+    for (const k of allKeys) {
+      if (typeof k === 'string' && k.startsWith(IDB_KEY_PREFIX)) {
+        orphaned.push(k);
+      }
+    }
+    if (orphaned.length === 0) return;
+    await Promise.all(orphaned.map((k) => idbDel(k))).catch(() => undefined);
+    console.log(`[Remote] GC: removed ${orphaned.length} orphaned IDB chunk(s)`);
+  } catch {
+    /* best-effort */
+  }
 }
 
 export function useRemoteTransfer(): RemoteTransferState {
@@ -649,8 +686,14 @@ export function useRemoteTransfer(): RemoteTransferState {
     setIncomingTransfer(null);
   }, []);
 
-  // Disconnect on component unmount
-  useEffect(() => () => { disconnect(); }, [disconnect]);
+  // MEM-04: sweep orphaned receive chunks on mount; disconnect on unmount.
+  // Both run only once for the lifetime of the hook because disconnect's
+  // identity is stable (useCallback with [] deps) and gcOrphanedReceiveChunks
+  // is a fire-and-forget Promise we deliberately don't await.
+  useEffect(() => {
+    void gcOrphanedReceiveChunks();
+    return () => { disconnect(); };
+  }, [disconnect]);
 
   // ── File send ─────────────────────────────────────────────────────────────
 
@@ -671,9 +714,13 @@ export function useRemoteTransfer(): RemoteTransferState {
       return;
     }
 
-    // SEC-03: reject before any network activity
-    if (file.size > MAX_FILE_SIZE) {
-      const msg = `File "${file.name}" (${file.size} bytes) exceeds the maximum allowed size`;
+    // SEC-03: reject before any network activity.
+    // Read the cap from agentSocket every call so a backend bump in MAX_FILE_SIZE
+    // takes effect without a frontend rebuild.  Falls back to the hardcoded 2 GB
+    // value only if agent_ready has not yet arrived.
+    const maxFileSize = agentSocket.maxAcceptedFileSize || FALLBACK_MAX_FILE_SIZE;
+    if (file.size > maxFileSize) {
+      const msg = `File "${file.name}" (${file.size} bytes) exceeds the maximum allowed size of ${maxFileSize} bytes`;
       console.error('[Remote]', msg);
       setLastError(msg);
       return;

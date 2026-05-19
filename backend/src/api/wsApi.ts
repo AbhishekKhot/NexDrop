@@ -31,7 +31,26 @@
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import type { AgentMessage, BrowserMessage, Transfer } from "../types";
-import { WS_API_PORT, DEVICE_NAME, ALLOW_REMOTE_WS, MAX_FILE_SIZE } from "../config";
+import {
+  WS_API_PORT,
+  DEVICE_NAME,
+  ALLOW_REMOTE_WS,
+  MAX_FILE_SIZE,
+  WS_ALLOWED_ORIGIN,
+} from "../config";
+
+/**
+ * SEC-10: parse WS_ALLOWED_ORIGIN once at module load.
+ *
+ * Supports a comma-separated list so operators can authorise multiple origins
+ * (e.g. dev server on :5173 plus a Caddy-fronted prod origin) without code
+ * changes. Each entry is trimmed; empty entries are dropped.
+ */
+const ALLOWED_ORIGINS = new Set(
+  WS_ALLOWED_ORIGIN.split(",")
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0),
+);
 
 /** How long (ms) an in-progress stream may be idle before being torn down — ERR-02 */
 const STREAM_INACTIVITY_TIMEOUT_MS = 60_000;
@@ -94,7 +113,36 @@ export class WsApiServer {
       res.end("NexDrop agent running");
     });
 
-    this.wss = new WebSocketServer({ server: httpServer });
+    /**
+     * SEC-10: Validate the Origin header during the WebSocket upgrade.
+     *
+     * Browsers always send Origin on WebSocket handshakes.  Without this check
+     * any web page the user visits could open a WS to ws://localhost:4001 and
+     * drive the local agent (initiate file sends, accept incoming transfers,
+     * read the peer list).  Validating against an allow-list closes that
+     * cross-origin attack surface entirely.
+     *
+     * verifyClient runs DURING the HTTP upgrade — rejected handshakes get an
+     * HTTP 403 and never enter the application-level connection handler.
+     *
+     * Non-browser clients can forge Origin freely.  The localhost-only check
+     * in the connection handler covers that side of the threat model.
+     */
+    this.wss = new WebSocketServer({
+      server: httpServer,
+      verifyClient: (info, cb) => {
+        const origin = info.req.headers.origin;
+        if (!origin || !ALLOWED_ORIGINS.has(origin)) {
+          console.warn(
+            `[WS API] Rejected WS upgrade: disallowed Origin "${origin ?? "<none>"}"`,
+          );
+          // Generic error string; specific Origin value is logged server-side
+          cb(false, 403, "Forbidden");
+          return;
+        }
+        cb(true);
+      },
+    });
 
     this.wss.on("connection", (ws, req) => {
       const clientIp = req.socket.remoteAddress ?? "";
