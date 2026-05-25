@@ -87,9 +87,14 @@ export function useAgentSocket(): AgentSocketState {
           setLastError(null);
           break;
 
-        case "peers_update":
-          setPeers(msg.peers);
+        case "peers_update": {
+          // Defensive dedup by id — mDNS announcements occasionally emit the
+          // same peer twice (separate IPv4/IPv6 SRV records). Last entry wins.
+          const unique = new Map<string, Peer>();
+          for (const p of msg.peers) unique.set(p.id, p);
+          setPeers([...unique.values()]);
           break;
+        }
 
         case "transfer_offer":
           setIncomingTransfer(msg.transfer);

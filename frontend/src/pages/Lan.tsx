@@ -65,9 +65,11 @@ export default function Lan({ peers, transfers, agentConnected, agentFailed, onS
         }
     }
 
-    const lanTransfers = Array.from(transfers.values()).filter((t) =>
-        peers.some((p) => p.id === t.peerId)
-    );
+    // Receive transfers carry the sender's IP as peerId (set in tcpServer.ts),
+    // which never matches a peer card's deviceId UUID — so any peer-match filter
+    // hides incoming transfers entirely. Show every transfer; eviction in
+    // useAgentSocket already prunes stale terminal entries.
+    const lanTransfers = Array.from(transfers.values());
 
     // EMA (α = 0.3) sampled at ≥1s intervals; chunkBytes uses fileSize/totalChunks because the final chunk may be smaller
     function getSpeedETA(t: Transfer): { speed: string; eta: string } | null {

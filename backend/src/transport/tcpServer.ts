@@ -22,6 +22,44 @@ const MAX_FRAME_PAYLOAD_BYTES = CHUNK_SIZE + 1024;
 // (PUBLIC_KEY, METADATA, DONE, ACCEPT, REJECT) come close to 64 KB.
 const MAX_CONTROL_FRAME_BYTES = 64 * 1024;
 
+// Caps on advisory peer-identity fields carried in METADATA. The sender controls
+// these (no auth in NexDrop by design), so the receiver must validate type +
+// length + content before letting them reach the UI or logs.
+const MAX_DEVICE_NAME_LEN = 64;
+const MAX_DEVICE_ID_LEN = 128;
+
+/**
+ * Sanitize a peer-claimed display name for safe use in logs and UI. Strips
+ * ASCII/Unicode control chars (line breaks, NULL, terminal escapes), trims
+ * whitespace, and enforces a length cap. Returns undefined if the input
+ * is not a usable string after cleaning.
+ */
+function sanitizePeerName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // Cap length BEFORE the regex pass to bound work on a hostile input. The
+  // regex has no nested quantifiers or backreferences, so it runs in linear
+  // time regardless. Escape sequences are used (not literal control chars)
+  // so the source file round-trips through editors and patches safely.
+  // eslint-disable-next-line no-control-regex
+  const CONTROL_CHARS = /[\x00-\x1F\x7F]/g;
+  const cleaned = raw.slice(0, MAX_DEVICE_NAME_LEN * 4).replace(CONTROL_CHARS, "").trim();
+  if (cleaned.length === 0) return undefined;
+  return cleaned.slice(0, MAX_DEVICE_NAME_LEN);
+}
+
+/**
+ * Validate a peer-claimed deviceId. We don't enforce UUID shape (frontend may
+ * evolve the format) but we do enforce a printable-ASCII allow-list and a
+ * length cap, so a malicious sender can't smuggle arbitrary bytes into our
+ * internal identifiers.
+ */
+function sanitizeDeviceId(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  if (raw.length === 0 || raw.length > MAX_DEVICE_ID_LEN) return undefined;
+  if (!/^[A-Za-z0-9_.:-]+$/.test(raw)) return undefined;
+  return raw;
+}
+
 export type TransferUpdateCallback = (transfer: Transfer) => void;
 export type IncomingOfferCallback = (transfer: Transfer) => void;
 
@@ -121,8 +159,8 @@ export function createTcpServer(
       if (metadata && transferId) {
         onUpdate({
           id: transferId,
-          peerId: remoteIp,
-          peerName: remoteIp,
+          peerId: peerDisplayId,
+          peerName: peerDisplayName,
           direction: "receive",
           fileName: metadata.fileName,
           fileSize: metadata.fileSize,
@@ -145,6 +183,10 @@ export function createTcpServer(
     let sessionKey: Buffer | null = null;
     let transferId: string | null = null;
     let bytesReceived = 0;
+    // Cached after METADATA passes sanitisation; reused on every transfer_update
+    // so the UI sees a consistent peer identity throughout the transfer.
+    let peerDisplayId: string = remoteIp;
+    let peerDisplayName: string = remoteIp;
 
     const myEcdh = generateECDHPair();
     writeControlFrame(socket, TcpFrameType.PUBLIC_KEY, {
@@ -249,10 +291,18 @@ export function createTcpServer(
 
           sessionKey = computeSessionKey(myEcdh.ecdh, metadata.senderPublicKey);
 
+          // Validated peer identity falls back to the connecting IP when the
+          // sender omits or malforms the advisory fields. Names are advisory
+          // only — there is no authentication of identity in NexDrop.
+          peerDisplayName =
+            sanitizePeerName(metadata.senderDeviceName) ?? remoteIp;
+          peerDisplayId =
+            sanitizeDeviceId(metadata.senderDeviceId) ?? remoteIp;
+
           const transfer: Transfer = {
             id: transferId,
-            peerId: socket.remoteAddress ?? "unknown",
-            peerName: socket.remoteAddress ?? "Unknown",
+            peerId: peerDisplayId,
+            peerName: peerDisplayName,
             direction: "receive",
             fileName: metadata.fileName,
             fileSize: metadata.fileSize,
@@ -308,8 +358,8 @@ export function createTcpServer(
             console.warn("[TCP Server] Exceeded MAX_FILE_SIZE mid-transfer — aborting");
             onUpdate({
               id: metadata.transferId,
-              peerId: socket.remoteAddress ?? "",
-              peerName: socket.remoteAddress ?? "",
+              peerId: peerDisplayId,
+              peerName: peerDisplayName,
               direction: "receive",
               fileName: metadata.fileName,
               fileSize: metadata.fileSize,
@@ -337,8 +387,8 @@ export function createTcpServer(
 
           onUpdate({
             id: metadata.transferId,
-            peerId: socket.remoteAddress ?? "",
-            peerName: socket.remoteAddress ?? "",
+            peerId: peerDisplayId,
+            peerName: peerDisplayName,
             direction: "receive",
             fileName: metadata.fileName,
             fileSize: metadata.fileSize,
@@ -373,8 +423,8 @@ export function createTcpServer(
 
           const transfer: Transfer = {
             id: metadata.transferId,
-            peerId: socket.remoteAddress ?? "",
-            peerName: socket.remoteAddress ?? "",
+            peerId: peerDisplayId,
+            peerName: peerDisplayName,
             direction: "receive",
             fileName: metadata.fileName,
             fileSize: metadata.fileSize,

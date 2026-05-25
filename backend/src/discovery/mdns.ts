@@ -12,6 +12,17 @@ import type { Peer } from "../types";
 export type PeersChangeCallback = (peers: Peer[]) => void;
 export type MdnsErrorCallback = (err: Error) => void;
 
+// IPv4 dotted-quad — matches well-formed addresses only; rejects mDNS quirks
+// like trailing dots or interface suffixes.
+const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}$/;
+
+function pickReachableAddress(addresses: readonly string[]): string | undefined {
+  const ipv4 = addresses.find((a) => IPV4_RE.test(a));
+  if (ipv4) return ipv4;
+  // Skip IPv6 link-local (fe80::/10) — needs a scope ID to be routable.
+  return addresses.find((a) => !a.toLowerCase().startsWith("fe80:"));
+}
+
 export class MdnsService {
   private bonjour: Bonjour;
   private browser: Browser | null = null;
@@ -82,13 +93,18 @@ export class MdnsService {
         // chaining handles this gracefully rather than crashing the handler.
         if (!peerId || peerId === this.deviceId) return;
 
+        // Prefer a non-link-local IPv4 address. fe80::/10 link-local IPv6
+        // addresses are not usable for cross-host TCP without a scope ID, so
+        // exposing them in the peer list would show a card that can't actually
+        // be reached. Fall back to the first usable address if no IPv4 exists.
+        const ip = pickReachableAddress(service.addresses ?? []);
+        if (!ip) return;
+
         const peer: Peer = {
           id: peerId,
           name:
             (service.txt as Record<string, string>)?.deviceName ?? service.name,
-          // service.addresses is a string[] of all interface addresses; [0] is
-          // typically the primary
-          ip: service.addresses?.[0],
+          ip,
           port: service.port,
           mode: "lan",
           status: "available",

@@ -94,6 +94,7 @@ wsApi.onSendFile = async (
       (transfer: Transfer) => {
         wsApi.broadcast({ type: "transfer_update", transfer });
       },
+      mdns.deviceId,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

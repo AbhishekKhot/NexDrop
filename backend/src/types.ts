@@ -32,6 +32,11 @@ export interface FileMetadata {
   senderPublicKey: string;
   chunkSize: number;
   protocolVersion: number;
+  // Optional and advisory: any peer on the LAN can claim any name (no auth
+  // by design). The receiver validates type/length/control-chars before using
+  // them for display, and falls back to the connecting IP if absent.
+  senderDeviceId?: string;
+  senderDeviceName?: string;
 }
 
 // terminal states: completed | rejected | error

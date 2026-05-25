@@ -4,7 +4,7 @@ import { generateECDHPair, computeSessionKey } from "../crypto/aesGcm";
 import { chunkFile, hashFile } from "../chunking/chunker";
 import type { Transfer, TcpControlFrame } from "../types";
 import { TcpFrameType, PROTOCOL_VERSION } from "../types";
-import { CHUNK_SIZE, MAX_FILE_SIZE, MAX_TRANSFER_BPS } from "../config";
+import { CHUNK_SIZE, MAX_FILE_SIZE, MAX_TRANSFER_BPS, DEVICE_NAME } from "../config";
 
 // Server → client frames are always control frames (PUBLIC_KEY, ACCEPT, REJECT) —
 // none should exceed 64 KB. A larger declared length is hostile.
@@ -94,6 +94,7 @@ export async function sendFileToPeer(
   fileBuffer: Buffer,
   fileName: string,
   onUpdate: TransferUpdateCallback,
+  senderDeviceId?: string,
 ): Promise<void> {
   // Reject oversized files before opening any socket — avoids wasting the peer's
   // connection slot and our own FD on a transfer we'll reject immediately.
@@ -199,6 +200,8 @@ export async function sendFileToPeer(
             senderPublicKey: myEcdh.publicKeyHex,
             chunkSize: CHUNK_SIZE,
             protocolVersion: PROTOCOL_VERSION,
+            senderDeviceId,
+            senderDeviceName: DEVICE_NAME,
           },
         });
 
