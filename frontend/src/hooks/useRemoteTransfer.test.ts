@@ -21,17 +21,12 @@ describe('useRemoteTransfer', () => {
       result.current.createRoom();
     });
 
-    // The mock WebSocket gets instantiated and open is assumed, 
-    // but the hook uses ws.send inside if state is OPEN.
-    // However, the test environment WebSocket mock might not trigger 'open' event automatically unless simulated.
-    // We mainly verify the function doesn't crash here.
     expect(typeof result.current.createRoom).toBe('function');
   });
 
   it('should add a transfer to state when sending a file', async () => {
     const { result } = renderHook(() => useRemoteTransfer());
-    
-    // Fake connect first
+
     act(() => {
       result.current.joinRoom('TEST_CODE');
     });

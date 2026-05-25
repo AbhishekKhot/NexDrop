@@ -12,7 +12,6 @@ export default function Home() {
             </div>
 
             <div className="mode-grid">
-                {/* LAN Card */}
                 <Link to="/lan" className="mode-card">
                     <span className="mode-card-icon">📡</span>
                     <h2>LAN Transfer</h2>
@@ -23,7 +22,6 @@ export default function Home() {
                     <span className="badge">Same Network</span>
                 </Link>
 
-                {/* Remote Card */}
                 <Link to="/remote" className="mode-card">
                     <span className="mode-card-icon">🌐</span>
                     <h2>Remote Transfer</h2>

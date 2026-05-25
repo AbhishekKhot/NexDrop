@@ -7,7 +7,6 @@ describe('Signaling Server', () => {
 
   beforeAll((done) => {
     server = createSignalingServer();
-    // Wait for listening
     server.on('listening', done);
   });
 
@@ -46,9 +45,8 @@ describe('Signaling Server', () => {
       
       if (msg.type === 'joined' && !roomId) {
         roomId = msg.roomId;
-        // Connect second peer
         ws2 = new WebSocket(`ws://localhost:${port}`);
-        
+
         ws2.on('open', () => {
           ws2.send(JSON.stringify({ type: 'join', roomId }));
         });
@@ -56,7 +54,6 @@ describe('Signaling Server', () => {
         ws2.on('message', (data2) => {
           const msg2 = JSON.parse(data2.toString());
           if (msg2.type === 'joined') {
-            // Second peer joined successfully, now let's send an offer
             ws1.send(JSON.stringify({ type: 'offer', sdp: { type: 'offer', sdp: 'xyz' } }));
           } else if (msg2.type === 'offer') {
             expect(msg2.sdp.sdp).toBe('xyz');
@@ -66,7 +63,6 @@ describe('Signaling Server', () => {
           }
         });
       } else if (msg.type === 'peer_joined') {
-        // First peer received notification 
         expect(true).toBe(true);
       }
     });

@@ -1,22 +1,14 @@
-# ============================================================
-#  NexDrop — Docker Compose
+# NexDrop — Docker Compose
 #
-#  Basic usage (no TLS):
-#    cp .env.example .env   # fill in your values
-#    docker compose up --build
+# Usage:
+#   cp .env.example .env   # fill in your values
+#   docker compose up --build
 #
-#  Production with TLS (Caddy auto-HTTPS):
-#    Set NEXDROP_DOMAIN in .env, then:
-#    docker compose --profile tls up --build
-#    Ports 80 and 443 must be reachable for Let's Encrypt.
-#    Frontend connects to wss://yourdomain/signaling (path-routed by Caddy).
-#
-#  LAN Mode note:
-#    mDNS multicast does not work in Docker's default bridge network.
-#    For LAN peer discovery on Linux, uncomment `network_mode: host`
-#    on the backend service. macOS/Windows Docker Desktop users must
-#    run the backend natively for LAN mode.
-# ============================================================
+# LAN Mode note:
+#   mDNS multicast does not work in Docker's default bridge network.
+#   For LAN peer discovery on Linux, uncomment `network_mode: host`
+#   on the backend service. macOS/Windows Docker Desktop users must
+#   run the backend natively for LAN mode.
 
 name: nexdrop
 
@@ -36,7 +28,7 @@ services:
     ports:
       - "${TCP_PORT:-4000}:4000"        # LAN TCP transfers
       - "${WS_API_PORT:-4001}:4001"     # Browser ↔ agent bridge (localhost-only in prod)
-      - "${SIGNALING_PORT:-4002}:4002"  # WebRTC signaling (fronted by Caddy in prod)
+      - "${SIGNALING_PORT:-4002}:4002"  # WebRTC signaling
 
     environment:
       TCP_PORT: ${TCP_PORT:-4000}
@@ -98,33 +90,6 @@ services:
       start_period: 10s
       retries: 3
 
-  # ── Caddy Reverse Proxy (TLS profile — production only) ─────────────
-  # Enable with: docker compose --profile tls up --build
-  # Requires NEXDROP_DOMAIN to be set in .env and ports 80/443 open.
-  caddy:
-    profiles: ["tls"]
-    image: caddy:2-alpine
-    container_name: nexdrop-caddy
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"  # HTTP/3
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    environment:
-      NEXDROP_DOMAIN: ${NEXDROP_DOMAIN:?Set NEXDROP_DOMAIN in .env to use TLS profile}
-    depends_on:
-      - backend
-      - frontend
-    restart: unless-stopped
-
-# ── Volumes ─────────────────────────────────────────────────────────────
 volumes:
   downloads:
-    driver: local
-  caddy_data:
-    driver: local
-  caddy_config:
     driver: local

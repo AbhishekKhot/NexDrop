@@ -1,6 +1,6 @@
 # NexDrop
 
-> Serverless, encrypted peer-to-peer file transfer — local network or internet-wide.
+> Encrypted peer-to-peer file transfer — local network or internet-wide.
 
 No accounts. No cloud storage. Files travel directly between peers, end-to-end encrypted.
 
@@ -16,9 +16,6 @@ No accounts. No cloud storage. Files travel directly between peers, end-to-end e
   - [Remote Mode](#remote-mode)
 - [UI Wireframes](#ui-wireframes)
 - [Security Model](#security-model)
-- [Docker Deployment](#docker-deployment)
-- [Environment Variables](#environment-variables)
-- [Known Issues & Bugs](#known-issues--bugs)
 
 ---
 
@@ -41,11 +38,8 @@ NexDrop/
 │   │   ├── lib/            ← agentSocket, webrtc, remoteCrypto
 │   │   └── pages/          ← Home, Lan, Remote
 │   └── README.md           ← Frontend setup & component guide
-├── Caddyfile               ← Reverse proxy + TLS (Let's Encrypt)
 ├── docker-compose.yml
-├── .env.example
-├── ERRORS.md               ← Known bugs, security issues, performance gaps
-└── CLAUDE.md               ← Project status & roadmap
+└── .env.example
 ```
 
 ---
@@ -63,7 +57,6 @@ NexDrop/
 | LAN discovery | mDNS service type `peerdrop._tcp` |
 | Remote discovery | WebSocket signaling + 8-char share codes |
 | NAT traversal | STUN (configurable), optional TURN |
-| Reverse proxy | Caddy (auto TLS via Let's Encrypt) |
 
 ---
 
@@ -328,59 +321,3 @@ sequenceDiagram
 | Forward secrecy | Yes (ephemeral key pair) | Yes (ephemeral key pair) |
 | Server sees file bytes | Never | Never |
 | Auth required | None (by design) | None (by design) |
-
----
-
-## Docker Deployment
-
-```bash
-# 1. Copy environment and fill in values
-cp .env.example .env
-
-# 2. Start without TLS (development)
-docker compose up --build
-
-# 3. Start with TLS (production) — requires NEXDROP_DOMAIN set in .env
-docker compose --profile tls up --build
-```
-
-| Service | Port | Description |
-|---|---|---|
-| frontend | 3000 | React SPA (nginx) |
-| backend | 4000 | TCP receive (LAN) |
-| backend | 4001 | WebSocket API (browser ↔ agent) |
-| backend | 4002 | WebRTC signaling relay |
-| caddy | 80, 443 | TLS reverse proxy (profile: tls) |
-
-> **LAN Mode + Docker:** mDNS multicast does not work on Docker's default bridge.
-> On Linux use `network_mode: "host"` for the backend service.
-> On macOS/Windows, run the backend natively and containerize only the frontend.
-
----
-
-## Environment Variables
-
-See [.env.example](.env.example) for the full list. Key variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `TCP_PORT` | `4000` | LAN TCP receive port |
-| `WS_API_PORT` | `4001` | Browser ↔ agent WebSocket port |
-| `SIGNALING_PORT` | `4002` | WebRTC signaling port |
-| `DEVICE_NAME` | hostname | Peer display name |
-| `ALLOW_REMOTE_WS` | `false` | Allow non-localhost WS (ngrok) |
-| `WS_ALLOWED_ORIGIN` | `http://localhost:5173` | CORS origin for WS API |
-| `DOWNLOAD_DIR` | `~/Downloads/NexDrop` | Where received files are saved |
-| `SIGNALING_MAX_CONN_PER_IP` | `5` | Max WebSocket connections per IP |
-| `SIGNALING_MAX_MSG_PER_SEC` | `20` | Max signaling messages per second |
-| `SIGNALING_ROOM_TTL_MS` | `600000` | Room expiry (10 min) |
-| `VITE_AGENT_WS_URL` | `ws://localhost:4001` | Frontend → agent URL |
-| `VITE_SIGNALING_URL` | `ws://localhost:4002` | Frontend → signaling URL |
-| `VITE_STUN_SERVERS` | Google STUN | Comma-separated STUN URLs |
-| `VITE_TURN_SERVER_URL` | _(empty)_ | TURN server (recommended for prod) |
-
----
-
-## Known Issues & Bugs
-
-See [ERRORS.md](ERRORS.md) for the full list of identified security issues, memory/CPU problems, and load-handling gaps — with severity ratings and suggested fixes.

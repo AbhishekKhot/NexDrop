@@ -1,7 +1,6 @@
 import '@testing-library/react';
 import { vi } from 'vitest';
 
-// Mock WebRTC
 class MockRTCPeerConnection {
   createDataChannel = vi.fn().mockReturnValue({
     send: vi.fn(),
@@ -25,7 +24,6 @@ global.RTCPeerConnection = MockRTCPeerConnection as any;
 global.RTCSessionDescription = vi.fn() as any;
 global.RTCIceCandidate = vi.fn() as any;
 
-// Mock WebSocket
 class MockWebSocket {
   send = vi.fn();
   close = vi.fn();
@@ -39,6 +37,5 @@ class MockWebSocket {
 
 global.WebSocket = MockWebSocket as any;
 
-// Mock URL
 global.URL.createObjectURL = vi.fn().mockReturnValue('mock-url');
 global.URL.revokeObjectURL = vi.fn();
