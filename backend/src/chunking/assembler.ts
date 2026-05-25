@@ -52,22 +52,26 @@ export function assembleChunks(
       };
     }
 
-    // Re-hashing plaintext catches cases where decryption "succeeds" but
-    // produces wrong bytes (e.g. key-derivation edge cases).
-    const actualHash = crypto
-      .createHash("sha256")
-      .update(plaintext)
-      .digest("hex");
+    // Per-chunk plaintext hash is optional defense-in-depth. The TCP wire
+    // format omits it (chunk.hash === "") and relies on the AES-GCM auth tag
+    // above plus the full-file SHA-256 below. Only verify when a hash is
+    // actually carried with the chunk.
+    if (chunk.hash) {
+      const actualHash = crypto
+        .createHash("sha256")
+        .update(plaintext)
+        .digest("hex");
 
-    if (actualHash !== chunk.hash) {
-      return {
-        ok: false,
-        error: {
-          kind: "hash_mismatch",
-          chunkIndex: chunk.index,
-          message: `Chunk ${chunk.index} hash mismatch: expected ${chunk.hash}, got ${actualHash}`,
-        },
-      };
+      if (actualHash !== chunk.hash) {
+        return {
+          ok: false,
+          error: {
+            kind: "hash_mismatch",
+            chunkIndex: chunk.index,
+            message: `Chunk ${chunk.index} hash mismatch: expected ${chunk.hash}, got ${actualHash}`,
+          },
+        };
+      }
     }
 
     plaintextParts.push(plaintext);
