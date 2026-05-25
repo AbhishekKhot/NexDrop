@@ -187,7 +187,17 @@ export function useRemoteTransfer(): RemoteTransferState {
     }
   }
 
-  const connectSignaling = useCallback(() => {
+  /**
+   * Returns the existing WS if open, or opens a new one. When `forceFresh` is
+   * true, any existing socket is closed first — used by joinRoom to leave the
+   * caller's auto-created room before joining the peer's room. (The signaling
+   * server enforces a one-room-per-connection invariant.)
+   */
+  const connectSignaling = useCallback((forceFresh = false) => {
+    if (forceFresh && wsRef.current) {
+      try { wsRef.current.close(); } catch { /* socket already torn down */ }
+      wsRef.current = null;
+    }
     if (wsRef.current?.readyState === WebSocket.OPEN) return wsRef.current;
     const ws = new WebSocket(SIGNALING_URL);
     wsRef.current = ws;
@@ -484,8 +494,13 @@ export function useRemoteTransfer(): RemoteTransferState {
 
   const joinRoom = useCallback((code: string) => {
     isInitiatorRef.current = false;
+    // Clear the share code shown in the UI from the auto-created room we're
+    // about to abandon; it would be misleading after we join the peer's room.
+    setShareCode(null);
     initP2P();
-    const ws = connectSignaling();
+    // Force a fresh WS — leaves the auto-created room on the server side so
+    // the join doesn't bounce with "Already in a room".
+    const ws = connectSignaling(true);
     const sendJoin = () => ws.send(JSON.stringify({ type: 'join', roomId: code }));
     ws.readyState === WebSocket.OPEN
       ? sendJoin()

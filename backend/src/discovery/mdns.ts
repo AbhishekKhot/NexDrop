@@ -1,5 +1,4 @@
 import Bonjour, { Browser, Service } from "bonjour-service";
-import os from "os";
 import { v4 as uuidv4 } from "uuid";
 import {
   MDNS_SERVICE_TYPE,
@@ -109,6 +108,25 @@ export class MdnsService {
           mode: "lan",
           status: "available",
         };
+
+        // Evict any stale peer at the same IP:port. When a peer restarts, its
+        // new agent gets a fresh deviceId, but the old mDNS announcement can
+        // linger on this side (multicast goodbye packets are lossy and the
+        // record TTL can be tens of minutes). Without this, the user sees
+        // both the old and new instance side-by-side until the TTL expires.
+        for (const [existingId, existingPeer] of this.peers) {
+          if (
+            existingId !== peerId &&
+            existingPeer.ip === peer.ip &&
+            existingPeer.port === peer.port
+          ) {
+            this.peers.delete(existingId);
+            console.log(
+              `[mDNS] Evicted stale peer ${existingId.slice(0, 8)} @ ${existingPeer.ip}:${existingPeer.port} (replaced by ${peerId.slice(0, 8)})`,
+            );
+          }
+        }
+
         this.peers.set(peerId, peer);
         console.log(
           `[mDNS] Peer discovered: ${peer.name} @ ${peer.ip}:${peer.port}`,
