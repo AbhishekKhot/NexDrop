@@ -627,7 +627,7 @@ export class RelayServer {
 
   // Operational logging only. Never logs share codes (bearer secrets), file
   // names, or payloads — see docs/RELAY_PROTOCOL.md §12.
-  private log(msg: string): void {
+  log(msg: string): void {
     if (process.env.NODE_ENV === "test") return;
     console.log(`[Relay] ${msg}`);
   }

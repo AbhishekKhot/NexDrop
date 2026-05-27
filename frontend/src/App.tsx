@@ -6,10 +6,12 @@ import Remote from './pages/Remote';
 import { useAgentSocket } from './hooks/useAgentSocket';
 import IncomingTransferModal from './components/IncomingTransferModal';
 import { ToastProvider, useToast } from './lib/toast';
+import { useRemoteStatus } from './lib/remoteStatus';
 
 function AppShell() {
   const location = useLocation();
   const { addToast } = useToast();
+  const remoteStatus = useRemoteStatus();
   const {
     connected,
     agentFailed,
@@ -41,6 +43,21 @@ function AppShell() {
     }
   }, [agentFailed, addToast]);
 
+  // Header status reflects the active mode: the relay/peer connection on the
+  // Remote page, the local agent on LAN/Home.
+  const onRemote = location.pathname === '/remote';
+  const headerStatus = onRemote
+    ? remoteStatus.peerConnected
+      ? { dot: 'connected', label: 'Peer connected' }
+      : remoteStatus.relayConnected
+        ? { dot: '', label: 'Waiting for peer' }
+        : { dot: '', label: 'Connecting…' }
+    : connected
+      ? { dot: 'connected', label: deviceName || 'Online' }
+      : agentFailed
+        ? { dot: 'failed', label: 'Agent unreachable' }
+        : { dot: '', label: 'Offline' };
+
   return (
     <div className="app">
       <nav className="navbar">
@@ -67,18 +84,12 @@ function AppShell() {
         </div>
 
         <div className="navbar-status">
-          <span className={`status-dot ${connected ? 'connected' : agentFailed ? 'failed' : ''}`} />
-          <span>
-            {connected
-              ? deviceName || 'Online'
-              : agentFailed
-                ? 'Agent unreachable'
-                : 'Offline'}
-          </span>
+          <span className={`status-dot ${headerStatus.dot}`} />
+          <span>{headerStatus.label}</span>
         </div>
       </nav>
 
-      {agentFailed && (
+      {agentFailed && !onRemote && (
         <div
           style={{
             background: '#2d1a1a',

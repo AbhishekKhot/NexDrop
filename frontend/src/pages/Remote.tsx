@@ -6,6 +6,7 @@ import IncomingTransferModal from '../components/IncomingTransferModal';
 import { formatBytes, formatState, formatSpeed, formatETA } from '../lib/utils';
 import { useRemoteTransfer } from '../hooks/useRemoteTransfer';
 import { useToast } from '../lib/toast';
+import { setRemoteStatus } from '../lib/remoteStatus';
 
 interface SpeedSample {
     lastChunks: number;
@@ -51,6 +52,12 @@ export default function Remote() {
     useEffect(() => {
         setSelectedPeer(remotePeer !== null);
     }, [remotePeer]);
+
+    // Report relay/peer connection to the app header (status indicator).
+    useEffect(() => {
+        setRemoteStatus({ relayConnected: shareCode !== null, peerConnected: remotePeer !== null });
+    }, [shareCode, remotePeer]);
+    useEffect(() => () => setRemoteStatus({ relayConnected: false, peerConnected: false }), []);
 
     function handleFileDrop(e: React.DragEvent) {
         e.preventDefault();
