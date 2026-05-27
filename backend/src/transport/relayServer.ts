@@ -111,6 +111,7 @@ export class RelayServer {
   private rooms = new Map<string, Room>();
   private connsPerIp = new Map<string, number>();
   private failedJoins = new Map<string, { count: number; windowStart: number }>();
+  private connCount = 0;
 
   constructor(
     port: number = RELAY_PORT,
@@ -170,11 +171,14 @@ export class RelayServer {
     const ip = this.getClientIp(req);
     const current = this.connsPerIp.get(ip) ?? 0;
     if (current >= this.limits.maxConnPerIp) {
+      this.log(`refused: per-IP connection cap from ${ip}`);
       this.sendError(ws, "RATE_LIMITED");
       ws.close(4029, "RATE_LIMITED");
       return;
     }
     this.connsPerIp.set(ip, current + 1);
+    this.connCount++;
+    this.log(`client connected (${this.connCount} open)`);
     ws.binaryType = "nodebuffer";
 
     const conn: RelayConn = {
@@ -196,6 +200,8 @@ export class RelayServer {
       const c = this.connsPerIp.get(ip) ?? 1;
       if (c <= 1) this.connsPerIp.delete(ip);
       else this.connsPerIp.set(ip, c - 1);
+      this.connCount--;
+      this.log(`client disconnected (${this.connCount} open)`);
       if (conn.room) this.cleanupRoom(conn.room, "peer disconnect");
     });
 
@@ -309,6 +315,7 @@ export class RelayServer {
     this.rooms.set(code, room);
     conn.room = room;
     this.sendJson(conn.ws, { t: "created", code });
+    this.log(`room created (${this.rooms.size} active)`);
   }
 
   private handleJoin(conn: RelayConn, m: Record<string, unknown>): void {
@@ -359,6 +366,7 @@ export class RelayServer {
       t: "peer_joined",
       peerMaxFileSize: conn.maxFileSize,
     });
+    this.log(`peer paired (${this.rooms.size} active)`);
   }
 
   private handleTransferBegin(
@@ -419,6 +427,7 @@ export class RelayServer {
       fileSize: m.fileSize,
       totalChunks,
     });
+    this.log(`transfer begin: ${m.fileSize} bytes, ${totalChunks} chunks`);
   }
 
   private handleTransferEnd(conn: RelayConn): void {
@@ -433,6 +442,7 @@ export class RelayServer {
     if (t.receiver.ws.readyState === WebSocket.OPEN) {
       this.sendJson(t.receiver.ws, { t: "transfer_end", transferId: t.transferId });
     }
+    this.log(`transfer end (${t.bytesForwarded} bytes forwarded)`);
   }
 
   // ── Data plane ──────────────────────────────────────────────────────
@@ -514,7 +524,8 @@ export class RelayServer {
   }
 
   // ── Room teardown ───────────────────────────────────────────────────
-  private cleanupRoom(room: Room, _reason: string): void {
+  private cleanupRoom(room: Room, reason: string): void {
+    if (!this.rooms.has(room.code)) return; // already torn down
     if (room.idleTimer) clearTimeout(room.idleTimer);
     if (room.absoluteTimer) clearTimeout(room.absoluteTimer);
     if (room.activeTransfer?.paused) {
@@ -530,6 +541,7 @@ export class RelayServer {
       }
     }
     this.rooms.delete(room.code);
+    this.log(`room closed: ${reason} (${this.rooms.size} active)`);
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────
@@ -611,6 +623,13 @@ export class RelayServer {
 
   private sendError(ws: WebSocket, code: ErrorCode): void {
     this.sendJson(ws, { t: "error", code });
+  }
+
+  // Operational logging only. Never logs share codes (bearer secrets), file
+  // names, or payloads — see docs/RELAY_PROTOCOL.md §12.
+  private log(msg: string): void {
+    if (process.env.NODE_ENV === "test") return;
+    console.log(`[Relay] ${msg}`);
   }
 }
 
