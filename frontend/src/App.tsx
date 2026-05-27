@@ -113,17 +113,7 @@ function AppShell() {
               />
             }
           />
-          <Route
-            path="/remote"
-            element={
-              <Remote
-                peers={peers.filter((p) => p.mode === 'remote')}
-                transfers={transfers}
-                agentConnected={connected}
-                onSendFile={sendFile}
-              />
-            }
-          />
+          <Route path="/remote" element={<Remote />} />
         </Routes>
       </main>
 

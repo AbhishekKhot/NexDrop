@@ -13,19 +13,11 @@ WORKDIR /app
 
 # Build-time arguments — docker-compose passes these from root .env
 ARG VITE_AGENT_WS_URL=ws://localhost:4001
-ARG VITE_SIGNALING_URL=ws://localhost:4002
-ARG VITE_STUN_SERVERS=stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
-ARG VITE_TURN_SERVER_URL=
-ARG VITE_TURN_USERNAME=
-ARG VITE_TURN_CREDENTIAL=
+ARG VITE_RELAY_URL=ws://localhost:4002
 
 # Expose as ENV so Vite's import.meta.env picks them up at build time
 ENV VITE_AGENT_WS_URL=$VITE_AGENT_WS_URL \
-    VITE_SIGNALING_URL=$VITE_SIGNALING_URL \
-    VITE_STUN_SERVERS=$VITE_STUN_SERVERS \
-    VITE_TURN_SERVER_URL=$VITE_TURN_SERVER_URL \
-    VITE_TURN_USERNAME=$VITE_TURN_USERNAME \
-    VITE_TURN_CREDENTIAL=$VITE_TURN_CREDENTIAL
+    VITE_RELAY_URL=$VITE_RELAY_URL
 
 COPY package*.json ./
 RUN npm ci

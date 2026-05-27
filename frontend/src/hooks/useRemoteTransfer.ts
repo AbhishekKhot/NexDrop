@@ -1,7 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { get as idbGet, set as idbSet, del as idbDel, keys as idbKeys } from 'idb-keyval';
-import { P2PConnection, STUN_SERVERS } from '../lib/webrtc';
-import { agentSocket } from '../lib/agentSocket';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   generateECDHKeyPair,
   exportPublicKeyBase64,
@@ -9,10 +6,9 @@ import {
   deriveSharedKey,
   encryptChunk,
   decryptChunk,
-  sha256Hex,
   type ECDHKeyPair,
 } from '../lib/remoteCrypto';
-import type { Transfer, Peer } from '../types';
+import type { Peer, Transfer } from '../types';
 
 export interface RemoteTransferState {
   shareCode: string | null;
@@ -29,58 +25,70 @@ export interface RemoteTransferState {
   disconnect: () => void;
 }
 
-const SIGNALING_URL =
+const RELAY_URL =
   (import.meta as unknown as { env: Record<string, string> }).env
-    .VITE_SIGNALING_URL ?? 'ws://localhost:4002';
+    .VITE_RELAY_URL ?? 'ws://localhost:4002';
 
-// 256 KB — must match backend CHUNK_SIZE
-const CHUNK_SIZE = 256 * 1024;
+const PROTOCOL_VERSION = 1;
 
-// Used only until agent_ready publishes the authoritative cap; reading
-// agentSocket.maxAcceptedFileSize at call time lets a backend bump take
-// effect without a frontend redeploy.
-const FALLBACK_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024;
+// Must match backend RELAY_CHUNK_SIZE (1 MiB).
+const CHUNK_SIZE = 1024 * 1024;
 
-// Per-chunk keys are `${IDB_KEY_PREFIX}${transferId}-${index}` — namespacing
-// lets parallel transfers coexist and makes batch cleanup trivial.
-const IDB_KEY_PREFIX = 'nexdrop-recv-';
+// Receivers without the File System Access API accumulate a Blob in memory;
+// cap that path well under the point where browsers refuse to allocate.
+const BLOB_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024;
 
-function chunkKey(storeKey: string, index: number): string {
-  return `${storeKey}-${index}`;
+// Pause the sender's reader when the socket's send buffer exceeds HIGH; resume
+// below LOW. Mirrors the relay's own watermarks.
+const BACKPRESSURE_HIGH = 8 * 1024 * 1024;
+const BACKPRESSURE_LOW = 1 * 1024 * 1024;
+
+const REMOTE_PEER: Peer = {
+  id: 'remote-peer',
+  name: 'Remote Peer',
+  mode: 'remote',
+  status: 'available',
+};
+
+// ── File System Access API (typed minimally; not in all lib.dom versions) ──
+interface WritableFileStreamLike {
+  write(data: BufferSource): Promise<void>;
+  close(): Promise<void>;
+  abort?(): Promise<void>;
+}
+interface FileHandleLike {
+  createWritable(): Promise<WritableFileStreamLike>;
+}
+type ShowSaveFilePicker = (opts?: {
+  suggestedName?: string;
+}) => Promise<FileHandleLike>;
+
+function getSaveFilePicker(): ShowSaveFilePicker | null {
+  const w = window as unknown as { showSaveFilePicker?: ShowSaveFilePicker };
+  return typeof w.showSaveFilePicker === 'function' ? w.showSaveFilePicker : null;
 }
 
-// Best-effort cleanup — swallow errors so a failure here doesn't pile on
-// top of whatever already triggered the cleanup.
-async function cleanupIdb(storeKey: string, totalChunks: number): Promise<void> {
-  const deletes: Promise<void>[] = [];
-  for (let i = 0; i < totalChunks; i++) {
-    deletes.push(idbDel(chunkKey(storeKey, i)));
+// Strip control chars and path separators so a peer-supplied name is safe to
+// show and to pass as a save-dialog suggestion (the peer is untrusted).
+function safeFileName(name: unknown): string {
+  if (typeof name !== 'string') return 'download';
+  let out = '';
+  for (const ch of name) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c >= 32 && c !== 127 && ch !== '/' && ch !== '\\') out += ch;
   }
-  await Promise.all(deletes).catch(() => { /* best-effort */ });
+  return out.slice(0, 255) || 'download';
 }
 
-/**
- * GC orphaned receive chunks from tabs killed mid-receive (close/crash/refresh).
- * The hook is the only writer of nexdrop-recv-* keys, so on a fresh mount every
- * matching key is orphaned. Active transfers use a fresh transferId so they
- * are unaffected. Errors are swallowed — IDB unavailable (private browsing,
- * quota) must not block hook initialisation.
- */
-async function gcOrphanedReceiveChunks(): Promise<void> {
-  try {
-    const allKeys = await idbKeys();
-    const orphaned: string[] = [];
-    for (const k of allKeys) {
-      if (typeof k === 'string' && k.startsWith(IDB_KEY_PREFIX)) {
-        orphaned.push(k);
-      }
-    }
-    if (orphaned.length === 0) return;
-    await Promise.all(orphaned.map((k) => idbDel(k))).catch(() => undefined);
-    console.log(`[Remote] GC: removed ${orphaned.length} orphaned IDB chunk(s)`);
-  } catch {
-    /* best-effort */
-  }
+interface ReceiveState {
+  transferId: string;
+  fileName: string;
+  fileSize: number;
+  totalChunks: number;
+  received: number;
+  expectedIndex: number;
+  writer: WritableFileStreamLike | null; // FSA path
+  parts: ArrayBuffer[] | null; // Blob fallback path
 }
 
 export function useRemoteTransfer(): RemoteTransferState {
@@ -91,433 +99,502 @@ export function useRemoteTransfer(): RemoteTransferState {
   const [lastError, setLastError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const p2pRef = useRef<P2PConnection | null>(null);
-  // Only the initiator sends the WebRTC offer when peer_joined fires; the
-  // joiner waits for the 'offer' message and answers.
-  const isInitiatorRef = useRef<boolean>(false);
+  // 'create' | { join: code } — applied once the welcome handshake completes.
+  const pendingIntentRef = useRef<'create' | { join: string } | null>(null);
+  const relayMaxFileSizeRef = useRef<number>(BLOB_MAX_FILE_SIZE);
+  const peerMaxFileSizeRef = useRef<number>(0);
 
   const keyPairRef = useRef<ECDHKeyPair | null>(null);
   const sharedKeyRef = useRef<CryptoKey | null>(null);
-
-  /**
-   * Gate that all binary chunk handlers await before decrypting. DataChannel
-   * chunks can arrive before the ECDH exchange completes on low-latency links.
-   * resetCrypto() creates a fresh unresolved Promise; startKeyExchange /
-   * finishKeyExchange resolve it once the key is ready.
-   */
-  const keyReadyPromiseRef = useRef<Promise<void>>(Promise.resolve());
+  const keyReadyRef = useRef<Promise<void>>(Promise.resolve());
   const keyReadyResolveRef = useRef<(() => void) | null>(null);
-  // Checked immediately after awaiting keyReadyPromiseRef so chunk handlers
-  // abort cleanly instead of producing an ambiguous "decrypt with null key" error.
-  const keyDerivationFailedRef = useRef(false);
+  const keyFailedRef = useRef(false);
 
-  const receiveMetaRef = useRef<{
-    fileName: string;
-    fileSize: number;
-    totalChunks: number;
-    chunksReceived: number;
-    transferId: string;
-    storeKey: string;
-    expectedHash: string | null;
-  } | null>(null);
-
-  const pendingSendsRef = useRef<Map<string, File>>(new Map());
-
-  /**
-   * ObjectURL revoke timers keyed by transferId.
-   * Revoking too early (before the browser completes the download) silently
-   * fails the download; never revoking leaks blob memory for the session.
-   * 1s after the link click is the sweet spot. Keyed by transferId so a
-   * (defensive) double-complete cancels the old timer before creating a new URL.
-   * All timers are cleared on disconnect() to prevent post-unmount callbacks.
-   */
+  const receiveRef = useRef<ReceiveState | null>(null);
+  const pendingSendRef = useRef<Map<string, File>>(new Map());
   const revokeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
-  function resetCrypto(): void {
+  // ── crypto helpers ──────────────────────────────────────────────────
+  const resetCrypto = useCallback(() => {
     keyPairRef.current = null;
     sharedKeyRef.current = null;
-    keyDerivationFailedRef.current = false;
-    const promise = new Promise<void>((resolve) => {
+    keyFailedRef.current = false;
+    keyReadyRef.current = new Promise<void>((resolve) => {
       keyReadyResolveRef.current = resolve;
     });
-    keyReadyPromiseRef.current = promise;
-  }
+  }, []);
 
-  // On failure, set the flag and resolve the gate so waiting chunk handlers
-  // unblock, see the flag, and abort instead of hanging forever.
-  async function startKeyExchange(): Promise<void> {
+  const startKeyExchange = useCallback(async () => {
     try {
       const pair = await generateECDHKeyPair();
       keyPairRef.current = pair;
-      const b64 = await exportPublicKeyBase64(pair.publicKey);
-      await p2pRef.current!.sendRaw(
-        JSON.stringify({ type: 'ecdh_hello', publicKey: b64 }),
-      );
+      const pub = await exportPublicKeyBase64(pair.publicKey);
+      wsRef.current?.send(JSON.stringify({ t: 'ecdh_hello', publicKey: pub }));
     } catch (err) {
-      console.error('[Crypto] Key exchange initiation failed:', err);
-      keyDerivationFailedRef.current = true;
+      console.error('[Remote] key exchange init failed', err);
+      keyFailedRef.current = true;
       keyReadyResolveRef.current?.();
     }
-  }
+  }, []);
 
-  /**
-   * Edge case — ecdh_hello arrives before our key pair is ready (theoretically
-   * possible on a very fast link). Treat as failure rather than risk a subtle
-   * crypto bug.
-   */
-  async function finishKeyExchange(b64RemotePubKey: string): Promise<void> {
+  const finishKeyExchange = useCallback(async (peerPubB64: string) => {
     try {
       if (!keyPairRef.current) {
-        console.error('[Crypto] Received ecdh_hello before our key pair was ready');
-        keyDerivationFailedRef.current = true;
+        keyFailedRef.current = true;
         keyReadyResolveRef.current?.();
         return;
       }
-      const remotePubKey = await importPublicKeyBase64(b64RemotePubKey);
+      const peerPub = await importPublicKeyBase64(peerPubB64);
       sharedKeyRef.current = await deriveSharedKey(
         keyPairRef.current.privateKey,
-        remotePubKey,
+        peerPub,
       );
       keyReadyResolveRef.current?.();
-      console.log('[Crypto] ECDH complete — AES-256-GCM session key ready');
     } catch (err) {
-      console.error('[Crypto] Shared key derivation failed:', err);
-      keyDerivationFailedRef.current = true;
+      console.error('[Remote] shared key derivation failed', err);
+      keyFailedRef.current = true;
       keyReadyResolveRef.current?.();
     }
-  }
-
-  /**
-   * Returns the existing WS if open, or opens a new one. When `forceFresh` is
-   * true, any existing socket is closed first — used by joinRoom to leave the
-   * caller's auto-created room before joining the peer's room. (The signaling
-   * server enforces a one-room-per-connection invariant.)
-   */
-  const connectSignaling = useCallback((forceFresh = false) => {
-    if (forceFresh && wsRef.current) {
-      try { wsRef.current.close(); } catch { /* socket already torn down */ }
-      wsRef.current = null;
-    }
-    if (wsRef.current?.readyState === WebSocket.OPEN) return wsRef.current;
-    const ws = new WebSocket(SIGNALING_URL);
-    wsRef.current = ws;
-
-    ws.onmessage = async (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        switch (msg.type) {
-          case 'joined':
-            setShareCode(msg.roomId);
-            console.log('[Signaling] Joined room:', msg.roomId);
-            break;
-          case 'peer_joined':
-            setRemotePeer({ id: 'remote-peer', name: 'Remote Peer', mode: 'remote', status: 'available' });
-            // Only the initiator sends the WebRTC offer
-            if (isInitiatorRef.current && p2pRef.current) {
-              const offer = await p2pRef.current.initiateSender((candidate) => {
-                ws.send(JSON.stringify({ type: 'ice', candidate }));
-              });
-              ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
-            }
-            break;
-          case 'offer':
-            if (p2pRef.current && !isInitiatorRef.current) {
-              const answer = await p2pRef.current.initiateReceiver(msg.sdp, (candidate) => {
-                ws.send(JSON.stringify({ type: 'ice', candidate }));
-              });
-              ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
-            }
-            break;
-          case 'answer':
-            if (isInitiatorRef.current) {
-              await p2pRef.current?.setRemoteDescription(msg.sdp);
-            }
-            break;
-          case 'ice':
-            await p2pRef.current?.addIceCandidate(msg.candidate);
-            break;
-          case 'peer_left':
-            setRemotePeer(null);
-            p2pRef.current?.close();
-            p2pRef.current = null;
-            break;
-          case 'error':
-            console.error('[Signaling] Error:', msg.message);
-            setLastError(msg.message);
-            break;
-        }
-      } catch (err) {
-        console.error('[Signaling] Message error', err);
-      }
-    };
-
-    ws.onclose = () => console.log('[Signaling] Disconnected');
-    return ws;
   }, []);
 
-  const initP2P = useCallback(() => {
-    p2pRef.current?.close();
-    resetCrypto();
+  // ── transfer-state helpers ──────────────────────────────────────────
+  const patchTransfer = useCallback(
+    (id: string, patch: Partial<Transfer>) => {
+      setTransfers((prev) => {
+        const next = new Map(prev);
+        const t = next.get(id);
+        if (t) next.set(id, { ...t, ...patch });
+        return next;
+      });
+    },
+    [],
+  );
 
-    const p2p = new P2PConnection(STUN_SERVERS);
-    p2pRef.current = p2p;
+  const failTransfer = useCallback(
+    (id: string, message: string) => {
+      patchTransfer(id, { state: 'error', errorMessage: message });
+      setLastError(message);
+    },
+    [patchTransfer],
+  );
 
-    p2p.onChannelState(async (state) => {
-      if (state === 'open') {
-        setRemotePeer({ id: 'remote-peer', name: 'Connected Peer', mode: 'remote', status: 'available' });
-        await startKeyExchange();
-      } else if (state === 'closed') {
-        setRemotePeer(null);
-        sharedKeyRef.current = null;
+  // ── receive finalisation ────────────────────────────────────────────
+  const finalizeReceive = useCallback(async () => {
+    const rm = receiveRef.current;
+    if (!rm) return;
+    receiveRef.current = null;
+
+    if (rm.received !== rm.totalChunks) {
+      if (rm.writer) await rm.writer.abort?.();
+      failTransfer(rm.transferId, 'Incomplete transfer — missing chunks');
+      return;
+    }
+
+    try {
+      if (rm.writer) {
+        await rm.writer.close();
+      } else if (rm.parts) {
+        const blob = new Blob(rm.parts);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = rm.fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        const timer = setTimeout(() => {
+          URL.revokeObjectURL(url);
+          revokeTimersRef.current.delete(rm.transferId);
+        }, 1000);
+        revokeTimersRef.current.set(rm.transferId, timer);
       }
-    });
+      patchTransfer(rm.transferId, { state: 'completed', completedAt: Date.now() });
+    } catch (err) {
+      console.error('[Remote] finalize failed', err);
+      failTransfer(rm.transferId, 'Failed to save received file');
+    }
+  }, [failTransfer, patchTransfer]);
 
-    p2p.onData(async (data) => {
-      if (typeof data === 'string') {
-        let meta: Record<string, unknown>;
-        try { meta = JSON.parse(data); } catch { return; }
+  const abortReceive = useCallback(
+    (message: string) => {
+      const rm = receiveRef.current;
+      if (!rm) return;
+      receiveRef.current = null;
+      void rm.writer?.abort?.();
+      failTransfer(rm.transferId, message);
+    },
+    [failTransfer],
+  );
 
-        if (meta.type === 'ecdh_hello') {
-          await finishKeyExchange(meta.publicKey as string);
-          return;
+  // ── incoming binary chunk ───────────────────────────────────────────
+  const handleBinary = useCallback(
+    async (data: ArrayBuffer) => {
+      const rm = receiveRef.current;
+      if (!rm) return;
+
+      await keyReadyRef.current;
+      if (keyFailedRef.current || !sharedKeyRef.current) {
+        abortReceive('Key exchange failed — transfer aborted');
+        return;
+      }
+
+      if (data.byteLength < 4) {
+        abortReceive('Malformed chunk frame');
+        return;
+      }
+      const index = new DataView(data).getUint32(0, false);
+      if (index !== rm.expectedIndex) {
+        abortReceive(`Chunk out of order (expected ${rm.expectedIndex}, got ${index})`);
+        return;
+      }
+
+      let plaintext: ArrayBuffer;
+      try {
+        plaintext = await decryptChunk(sharedKeyRef.current, data.slice(4));
+      } catch {
+        abortReceive('Decryption failed — transfer may have been tampered with');
+        return;
+      }
+
+      try {
+        if (rm.writer) await rm.writer.write(plaintext);
+        else rm.parts?.push(plaintext);
+      } catch (err) {
+        console.error('[Remote] write failed', err);
+        abortReceive('Failed to write received chunk');
+        return;
+      }
+
+      rm.expectedIndex++;
+      rm.received++;
+      if (rm.received % 8 === 0 || rm.received === rm.totalChunks) {
+        patchTransfer(rm.transferId, { chunksReceived: rm.received });
+      }
+    },
+    [abortReceive, patchTransfer],
+  );
+
+  // ── control-frame dispatch ──────────────────────────────────────────
+  const handleControl = useCallback(
+    async (msg: Record<string, unknown>) => {
+      switch (msg.t) {
+        case 'welcome': {
+          if (typeof msg.maxFileSize === 'number') {
+            relayMaxFileSizeRef.current = msg.maxFileSize;
+          }
+          // Our receive capability: stream-to-disk (FSA) can take the relay
+          // cap; the Blob fallback is limited to BLOB_MAX_FILE_SIZE.
+          const myCap = getSaveFilePicker()
+            ? relayMaxFileSizeRef.current
+            : Math.min(relayMaxFileSizeRef.current, BLOB_MAX_FILE_SIZE);
+          const intent = pendingIntentRef.current;
+          pendingIntentRef.current = null;
+          if (intent === 'create') {
+            wsRef.current?.send(JSON.stringify({ t: 'create', maxFileSize: myCap }));
+          } else if (intent && 'join' in intent) {
+            wsRef.current?.send(
+              JSON.stringify({ t: 'join', code: intent.join, maxFileSize: myCap }),
+            );
+          }
+          break;
         }
-
-        if (meta.type === 'transfer_offer') {
-          const transfer: Transfer = {
-            id: meta.transferId as string,
-            peerId: 'remote-peer',
-            peerName: 'Connected Peer',
+        case 'created':
+          setShareCode(msg.code as string);
+          break;
+        case 'joined':
+          setShareCode(msg.code as string);
+          peerMaxFileSizeRef.current = (msg.peerMaxFileSize as number) ?? 0;
+          setRemotePeer(REMOTE_PEER);
+          resetCrypto();
+          void startKeyExchange();
+          break;
+        case 'peer_joined':
+          peerMaxFileSizeRef.current = (msg.peerMaxFileSize as number) ?? 0;
+          setRemotePeer(REMOTE_PEER);
+          resetCrypto();
+          void startKeyExchange();
+          break;
+        case 'peer_left':
+          setRemotePeer(null);
+          sharedKeyRef.current = null;
+          if (receiveRef.current) abortReceive('Peer disconnected');
+          break;
+        case 'ecdh_hello':
+          await finishKeyExchange(msg.publicKey as string);
+          break;
+        case 'offer_transfer': {
+          const transferId = msg.transferId as string;
+          const offer: Transfer = {
+            id: transferId,
+            peerId: REMOTE_PEER.id,
+            peerName: REMOTE_PEER.name,
             direction: 'receive',
-            fileName: meta.fileName as string,
-            fileSize: meta.fileSize as number,
-            totalChunks: meta.totalChunks as number,
+            fileName: safeFileName(msg.fileName),
+            fileSize: typeof msg.fileSize === 'number' ? msg.fileSize : 0,
+            totalChunks: typeof msg.totalChunks === 'number' ? msg.totalChunks : 0,
             chunksReceived: 0,
             state: 'pending',
           };
-          setIncomingTransfer(transfer);
-          setTransfers((prev) => new Map(prev).set(meta.transferId as string, transfer));
-          return;
+          setIncomingTransfer(offer);
+          setTransfers((prev) => new Map(prev).set(transferId, offer));
+          break;
         }
-
-        if (meta.type === 'transfer_decision') {
-          const { transferId, accepted } = meta as { transferId: string; accepted: boolean };
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(transferId);
-            if (t) next.set(transferId, {
-              ...t,
-              state: accepted ? 'transferring' : 'rejected',
-              errorMessage: accepted ? undefined : 'Rejected by peer',
-            });
-            return next;
-          });
+        case 'transfer_decision': {
+          const transferId = msg.transferId as string;
+          const accepted = msg.accepted === true;
           if (accepted) {
-            const file = pendingSendsRef.current.get(transferId);
+            patchTransfer(transferId, { state: 'transferring' });
+            const file = pendingSendRef.current.get(transferId);
             if (file) {
-              pendingSendsRef.current.delete(transferId);
-              streamChunks(transferId, file);
+              pendingSendRef.current.delete(transferId);
+              void streamFile(transferId, file);
             }
           } else {
-            pendingSendsRef.current.delete(transferId);
+            pendingSendRef.current.delete(transferId);
+            patchTransfer(transferId, { state: 'rejected', errorMessage: 'Rejected by peer' });
           }
-          return;
+          break;
         }
-
-        if (meta.type === 'send_file_start') {
-          const storeKey = `${IDB_KEY_PREFIX}${meta.transferId as string}`;
-          receiveMetaRef.current = {
-            fileName: meta.fileName as string,
-            fileSize: meta.fileSize as number,
-            totalChunks: meta.totalChunks as number,
-            chunksReceived: 0,
-            transferId: meta.transferId as string,
-            storeKey,
-            expectedHash: null,
-          };
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(meta.transferId as string);
-            if (t) next.set(meta.transferId as string, { ...t, state: 'transferring' });
-            return next;
-          });
-          return;
-        }
-
-        if (meta.type === 'send_file_end') {
-          const rm = receiveMetaRef.current;
-          if (!rm) return;
-
-          // Read each chunk back in index order from IDB rather than holding
-          // the whole file in a JS array.
-          const parts: ArrayBuffer[] = [];
-          for (let i = 0; i < rm.totalChunks; i++) {
-            const chunk = await idbGet<ArrayBuffer>(chunkKey(rm.storeKey, i));
-            if (!chunk) {
-              console.error(`[Receive] Missing IDB chunk ${i} for ${rm.fileName}`);
-              setTransfers((prev) => {
-                const next = new Map(prev);
-                const t = next.get(rm.transferId);
-                if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Reassembly failed — missing chunk' });
-                return next;
-              });
-              await cleanupIdb(rm.storeKey, rm.totalChunks);
-              receiveMetaRef.current = null;
-              return;
-            }
-            parts.push(chunk);
+        case 'transfer_begin': {
+          // Receiver side: sender armed the transfer. receiveRef was prepared in
+          // acceptRemoteTransfer (incl. the FSA writer opened under a user gesture).
+          const rm = receiveRef.current;
+          if (rm && rm.transferId === msg.transferId) {
+            if (typeof msg.totalChunks === 'number') rm.totalChunks = msg.totalChunks;
+            patchTransfer(rm.transferId, { state: 'transferring', totalChunks: rm.totalChunks });
           }
+          break;
+        }
+        case 'transfer_end':
+          void finalizeReceive();
+          break;
+        case 'error':
+          setLastError(`Relay: ${String(msg.code ?? 'unknown error')}`);
+          break;
+      }
+    },
+    [abortReceive, finalizeReceive, finishKeyExchange, patchTransfer, resetCrypto, startKeyExchange],
+  );
 
-          const fileBuffer = await new Blob(parts).arrayBuffer();
-          const actualHash = await sha256Hex(fileBuffer);
-          const expectedHash = meta.sha256 as string | undefined;
+  // streamFile is defined as a stable ref-reading function (not a useCallback)
+  // so handleControl can call it without a dependency cycle.
+  const streamFileRef = useRef<(transferId: string, file: File) => Promise<void>>(
+    async () => undefined,
+  );
+  streamFileRef.current = async (transferId: string, file: File) => {
+    const ws = wsRef.current;
+    const key = sharedKeyRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !key) {
+      failTransfer(transferId, 'Not connected to a remote peer');
+      return;
+    }
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
+    ws.send(JSON.stringify({ t: 'transfer_begin', transferId, fileSize: file.size, totalChunks }));
 
-          // End-to-end integrity check — catches reassembly bugs even when
-          // every individual chunk decrypted successfully.
-          if (expectedHash && actualHash !== expectedHash) {
-            console.error(`[Crypto] Integrity FAILED — expected ${expectedHash}, got ${actualHash}`);
-            setTransfers((prev) => {
-              const next = new Map(prev);
-              const t = next.get(rm.transferId);
-              if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'File integrity check failed' });
-              return next;
-            });
-            await cleanupIdb(rm.storeKey, rm.totalChunks);
-            receiveMetaRef.current = null;
+    try {
+      for (let i = 0; i < totalChunks; i++) {
+        const slice = file.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, file.size));
+        const plaintext = await slice.arrayBuffer();
+        const encrypted = await encryptChunk(key, plaintext);
+        const frame = new Uint8Array(4 + encrypted.byteLength);
+        new DataView(frame.buffer).setUint32(0, i, false);
+        frame.set(new Uint8Array(encrypted), 4);
+
+        if (ws.bufferedAmount > BACKPRESSURE_HIGH) await waitForDrain(ws);
+        if (ws.readyState !== WebSocket.OPEN) throw new Error('connection lost');
+        ws.send(frame);
+
+        if ((i + 1) % 8 === 0 || i + 1 === totalChunks) {
+          patchTransfer(transferId, { chunksReceived: i + 1 });
+        }
+      }
+      ws.send(JSON.stringify({ t: 'transfer_end', transferId }));
+      patchTransfer(transferId, { state: 'completed', completedAt: Date.now() });
+    } catch (err) {
+      console.error('[Remote] send failed', err);
+      failTransfer(transferId, 'Transfer failed — the connection may have dropped');
+    }
+  };
+  function streamFile(transferId: string, file: File): Promise<void> {
+    return streamFileRef.current(transferId, file);
+  }
+
+  // ── connection ──────────────────────────────────────────────────────
+  const connect = useCallback(
+    (intent: 'create' | { join: string }) => {
+      try {
+        wsRef.current?.close();
+      } catch {
+        /* already closed */
+      }
+      pendingIntentRef.current = intent;
+      const ws = new WebSocket(RELAY_URL);
+      ws.binaryType = 'arraybuffer';
+      wsRef.current = ws;
+
+      ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION }));
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          let msg: Record<string, unknown>;
+          try {
+            msg = JSON.parse(event.data);
+          } catch {
             return;
           }
-
-          // Cancel any stale revoke timer for this transferId before creating
-          // a new ObjectURL — prevents the old timer from revoking the new URL.
-          const existingTimer = revokeTimersRef.current.get(rm.transferId);
-          if (existingTimer) clearTimeout(existingTimer);
-
-          const blob = new Blob([fileBuffer]);
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = rm.fileName;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-
-          const timerId = setTimeout(() => {
-            URL.revokeObjectURL(url);
-            revokeTimersRef.current.delete(rm.transferId);
-          }, 1000);
-          revokeTimersRef.current.set(rm.transferId, timerId);
-
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, state: 'completed', completedAt: Date.now() });
-            return next;
-          });
-
-          await cleanupIdb(rm.storeKey, rm.totalChunks);
-          receiveMetaRef.current = null;
-          return;
+          void handleControl(msg);
+        } else if (event.data instanceof ArrayBuffer) {
+          void handleBinary(event.data);
         }
-      }
-
-      if (data instanceof ArrayBuffer) {
-        const rm = receiveMetaRef.current;
-        if (!rm) return;
-
-        // Block until ECDH is complete — awaiting an already-resolved Promise
-        // is nearly free (microtask hop).
-        await keyReadyPromiseRef.current;
-
-        if (keyDerivationFailedRef.current || !sharedKeyRef.current) {
-          console.error('[Crypto] Key exchange failed — aborting transfer');
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Key exchange failed' });
-            return next;
-          });
-          p2pRef.current?.close();
-          p2pRef.current = null;
-          await cleanupIdb(rm.storeKey, rm.totalChunks);
-          receiveMetaRef.current = null;
-          return;
-        }
-
-        let plaintext: ArrayBuffer;
-        try {
-          plaintext = await decryptChunk(sharedKeyRef.current, data);
-        } catch (err) {
-          console.error('[Crypto] Decryption failed:', err);
-          // Abort on first decrypt failure — continuing would produce silently
-          // corrupted output.
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, state: 'error', errorMessage: 'Decryption failed — transfer aborted' });
-            return next;
-          });
-          setLastError('Decryption failed — transfer may have been tampered with');
-          p2pRef.current?.close();
-          p2pRef.current = null;
-          await cleanupIdb(rm.storeKey, rm.totalChunks);
-          receiveMetaRef.current = null;
-          return;
-        }
-
-        // Write to IDB immediately so only one 256 KB buffer (the current
-        // chunk) lives in memory regardless of total file size.
-        await idbSet(chunkKey(rm.storeKey, rm.chunksReceived), plaintext);
-        rm.chunksReceived++;
-
-        // Throttle setState to every 10 chunks (or final) so large files
-        // don't drown React in renders.
-        if (rm.chunksReceived % 10 === 0 || rm.chunksReceived === rm.totalChunks) {
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(rm.transferId);
-            if (t) next.set(rm.transferId, { ...t, chunksReceived: rm.chunksReceived });
-            return next;
-          });
-        }
-      }
-    });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+      };
+      ws.onerror = () => setLastError('Relay connection error');
+      ws.onclose = () => {
+        if (wsRef.current === ws) setRemotePeer(null);
+      };
+    },
+    [handleBinary, handleControl],
+  );
 
   const createRoom = useCallback(() => {
-    isInitiatorRef.current = true;
-    initP2P();
-    const ws = connectSignaling();
-    const sendCreate = () => ws.send(JSON.stringify({ type: 'create' }));
-    ws.readyState === WebSocket.OPEN
-      ? sendCreate()
-      : ws.addEventListener('open', sendCreate, { once: true });
-  }, [connectSignaling, initP2P]);
-
-  const joinRoom = useCallback((code: string) => {
-    isInitiatorRef.current = false;
-    // Clear the share code shown in the UI from the auto-created room we're
-    // about to abandon; it would be misleading after we join the peer's room.
     setShareCode(null);
-    initP2P();
-    // Force a fresh WS — leaves the auto-created room on the server side so
-    // the join doesn't bounce with "Already in a room".
-    const ws = connectSignaling(true);
-    const sendJoin = () => ws.send(JSON.stringify({ type: 'join', roomId: code }));
-    ws.readyState === WebSocket.OPEN
-      ? sendJoin()
-      : ws.addEventListener('open', sendJoin, { once: true });
-  }, [connectSignaling, initP2P]);
+    connect('create');
+  }, [connect]);
 
-  // Cancels pending ObjectURL revoke timers so they don't fire setState on
-  // an unmounted component.
+  const joinRoom = useCallback(
+    (code: string) => {
+      const trimmed = code.trim().toUpperCase();
+      if (!/^[0-9A-HJKMNP-TV-Z]{10}$/.test(trimmed)) {
+        setLastError('Invalid share code');
+        return;
+      }
+      setShareCode(null);
+      connect({ join: trimmed });
+    },
+    [connect],
+  );
+
+  // ── send ────────────────────────────────────────────────────────────
+  const sendRemoteFile = useCallback(
+    async (file: File) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN || !remotePeer) {
+        setLastError('Not connected to a remote peer');
+        return;
+      }
+      const cap = Math.min(
+        relayMaxFileSizeRef.current,
+        peerMaxFileSizeRef.current || relayMaxFileSizeRef.current,
+      );
+      if (file.size > cap) {
+        setLastError(
+          `File is too large for this transfer (max ${Math.floor(cap / (1024 * 1024))} MB). ` +
+            `The receiver may need Chrome/Edge for larger files.`,
+        );
+        return;
+      }
+
+      await keyReadyRef.current;
+      if (keyFailedRef.current || !sharedKeyRef.current) {
+        setLastError('Secure channel not ready — try reconnecting');
+        return;
+      }
+
+      const transferId = crypto.randomUUID();
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
+      setTransfers((prev) =>
+        new Map(prev).set(transferId, {
+          id: transferId,
+          peerId: REMOTE_PEER.id,
+          peerName: REMOTE_PEER.name,
+          direction: 'send',
+          fileName: file.name,
+          fileSize: file.size,
+          totalChunks,
+          chunksReceived: 0,
+          state: 'pending',
+        }),
+      );
+      pendingSendRef.current.set(transferId, file);
+      ws.send(
+        JSON.stringify({
+          t: 'offer_transfer',
+          transferId,
+          fileName: file.name,
+          fileSize: file.size,
+          totalChunks,
+        }),
+      );
+    },
+    [remotePeer],
+  );
+
+  // ── accept / reject ─────────────────────────────────────────────────
+  const acceptRemoteTransfer = useCallback(
+    async (transferId: string) => {
+      const offer = transfers.get(transferId);
+      setIncomingTransfer(null);
+      if (!offer) return;
+
+      // Open the FSA writer here — acceptRemoteTransfer runs inside the modal's
+      // click handler, the user gesture showSaveFilePicker() requires.
+      const picker = getSaveFilePicker();
+      let writer: WritableFileStreamLike | null = null;
+      if (picker) {
+        try {
+          const handle = await picker({ suggestedName: offer.fileName });
+          writer = await handle.createWritable();
+        } catch {
+          // User cancelled the save dialog → treat as reject.
+          wsRef.current?.send(
+            JSON.stringify({ t: 'transfer_decision', transferId, accepted: false }),
+          );
+          patchTransfer(transferId, { state: 'rejected', errorMessage: 'Save cancelled' });
+          return;
+        }
+      }
+
+      receiveRef.current = {
+        transferId,
+        fileName: offer.fileName,
+        fileSize: offer.fileSize,
+        totalChunks: offer.totalChunks,
+        received: 0,
+        expectedIndex: 0,
+        writer,
+        parts: writer ? null : [],
+      };
+      patchTransfer(transferId, { state: 'transferring' });
+      wsRef.current?.send(
+        JSON.stringify({ t: 'transfer_decision', transferId, accepted: true }),
+      );
+    },
+    [patchTransfer, transfers],
+  );
+
+  const rejectRemoteTransfer = useCallback(
+    (transferId: string) => {
+      setIncomingTransfer(null);
+      wsRef.current?.send(
+        JSON.stringify({ t: 'transfer_decision', transferId, accepted: false }),
+      );
+      patchTransfer(transferId, { state: 'rejected' });
+    },
+    [patchTransfer],
+  );
+
+  const dismissIncoming = useCallback(() => setIncomingTransfer(null), []);
+
+  // ── teardown ────────────────────────────────────────────────────────
   const disconnect = useCallback(() => {
-    for (const [, timerId] of revokeTimersRef.current) {
-      clearTimeout(timerId);
-    }
+    for (const timer of revokeTimersRef.current.values()) clearTimeout(timer);
     revokeTimersRef.current.clear();
-
-    p2pRef.current?.close();
-    p2pRef.current = null;
-    wsRef.current?.close();
+    void receiveRef.current?.writer?.abort?.();
+    receiveRef.current = null;
+    pendingSendRef.current.clear();
+    try {
+      wsRef.current?.close();
+    } catch {
+      /* already closed */
+    }
     wsRef.current = null;
     sharedKeyRef.current = null;
     keyPairRef.current = null;
@@ -526,155 +603,13 @@ export function useRemoteTransfer(): RemoteTransferState {
     setIncomingTransfer(null);
   }, []);
 
-  useEffect(() => {
-    void gcOrphanedReceiveChunks();
-    return () => { disconnect(); };
-  }, [disconnect]);
-
-  const sendRemoteFile = useCallback(async (file: File) => {
-    if (!p2pRef.current || p2pRef.current.connectionState !== 'connected') {
-      const msg = 'Not connected to a remote peer';
-      console.error('[Remote]', msg);
-      setLastError(msg);
-      return;
-    }
-
-    // Read the cap from agentSocket per call so a backend MAX_FILE_SIZE bump
-    // takes effect without a frontend rebuild.
-    const maxFileSize = agentSocket.maxAcceptedFileSize || FALLBACK_MAX_FILE_SIZE;
-    if (file.size > maxFileSize) {
-      const msg = `File "${file.name}" (${file.size} bytes) exceeds the maximum allowed size of ${maxFileSize} bytes`;
-      console.error('[Remote]', msg);
-      setLastError(msg);
-      return;
-    }
-
-    // Offer must travel over the encrypted channel
-    await keyReadyPromiseRef.current;
-
-    const transferId = crypto.randomUUID();
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-    setTransfers((prev) => new Map(prev).set(transferId, {
-      id: transferId,
-      peerId: 'remote-peer',
-      peerName: 'Connected Peer',
-      direction: 'send',
-      fileName: file.name,
-      fileSize: file.size,
-      totalChunks,
-      chunksReceived: 0,
-      state: 'pending',
-    }));
-
-    pendingSendsRef.current.set(transferId, file);
-
-    try {
-      await p2pRef.current.sendRaw(
-        JSON.stringify({ type: 'transfer_offer', transferId, fileName: file.name, fileSize: file.size, totalChunks }),
-      );
-    } catch (e) {
-      console.error('[Remote] Offer failed', e);
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        const t = next.get(transferId);
-        if (t) next.set(transferId, { ...t, state: 'error', errorMessage: 'Failed to send transfer offer' });
-        return next;
-      });
-      setLastError('Failed to send transfer offer');
-    }
-  }, []);
-
-  async function streamChunks(transferId: string, file: File): Promise<void> {
-    const p2p = p2pRef.current;
-    const key = sharedKeyRef.current;
-    if (!p2p || p2p.connectionState !== 'connected' || !key) {
-      console.error('[Remote] Cannot stream: not connected or no key');
-      return;
-    }
-
-    const fileHash = await sha256Hex(await file.arrayBuffer());
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-    try {
-      await p2p.sendRaw(
-        JSON.stringify({ type: 'send_file_start', transferId, fileName: file.name, fileSize: file.size, totalChunks }),
-      );
-
-      for (let i = 0; i < totalChunks; i++) {
-        const start = i * CHUNK_SIZE;
-        // file.slice() reads only 256 KB per iteration — avoids holding the
-        // full file in memory.
-        const slice = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
-        const plaintext = await slice.arrayBuffer();
-        await p2p.sendRaw(await encryptChunk(key, plaintext));
-
-        if ((i + 1) % 10 === 0 || i + 1 === totalChunks) {
-          setTransfers((prev) => {
-            const next = new Map(prev);
-            const t = next.get(transferId);
-            if (t) next.set(transferId, { ...t, chunksReceived: i + 1 });
-            return next;
-          });
-        }
-      }
-
-      await p2p.sendRaw(JSON.stringify({ type: 'send_file_end', transferId, sha256: fileHash }));
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        const t = next.get(transferId);
-        if (t) next.set(transferId, { ...t, state: 'completed', completedAt: Date.now() });
-        return next;
-      });
-    } catch (e) {
-      console.error('[Remote] Stream failed', e);
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        const t = next.get(transferId);
-        if (t) next.set(transferId, { ...t, state: 'error', errorMessage: 'Stream failed' });
-        return next;
-      });
-      setLastError('File stream failed — the connection may have dropped');
-    }
-  }
-
-  const acceptRemoteTransfer = useCallback(async (transferId: string) => {
-    setIncomingTransfer(null);
-    try {
-      await p2pRef.current?.sendRaw(
-        JSON.stringify({ type: 'transfer_decision', transferId, accepted: true }),
-      );
-    } catch (err) {
-      console.error('[Remote] Accept failed', err);
-      setLastError('Failed to send accept decision');
-    }
-  }, []);
-
-  const rejectRemoteTransfer = useCallback(async (transferId: string) => {
-    setIncomingTransfer(null);
-    try {
-      await p2pRef.current?.sendRaw(
-        JSON.stringify({ type: 'transfer_decision', transferId, accepted: false }),
-      );
-      setTransfers((prev) => {
-        const next = new Map(prev);
-        const t = next.get(transferId);
-        if (t) next.set(transferId, { ...t, state: 'rejected' });
-        return next;
-      });
-    } catch (err) {
-      console.error('[Remote] Reject failed', err);
-      setLastError('Failed to send reject decision');
-    }
-  }, []);
-
-  const dismissIncoming = useCallback(() => setIncomingTransfer(null), []);
+  useEffect(() => () => disconnect(), [disconnect]);
 
   return {
     shareCode,
     remotePeer,
-    transfers,
     incomingTransfer,
+    transfers,
     lastError,
     createRoom,
     joinRoom,
@@ -684,4 +619,17 @@ export function useRemoteTransfer(): RemoteTransferState {
     dismissIncoming,
     disconnect,
   };
+}
+
+function waitForDrain(ws: WebSocket): Promise<void> {
+  return new Promise((resolve) => {
+    const check = (): void => {
+      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount <= BACKPRESSURE_LOW) {
+        resolve();
+      } else {
+        setTimeout(check, 20);
+      }
+    };
+    setTimeout(check, 20);
+  });
 }

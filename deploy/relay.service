@@ -1,0 +1,46 @@
+# NexDrop Remote Relay — systemd unit
+#
+# Install:
+#   sudo cp deploy/relay.service /etc/systemd/system/nexdrop-relay.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nexdrop-relay
+#
+# Assumes the repo is built at /opt/nexdrop (see deploy/README.md) and a
+# dedicated unprivileged `nexdrop` user exists.
+
+[Unit]
+Description=NexDrop Remote Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexdrop
+Group=nexdrop
+WorkingDirectory=/opt/nexdrop/backend
+EnvironmentFile=/opt/nexdrop/backend/.env
+ExecStart=/usr/bin/node dist/relay.js
+Restart=on-failure
+RestartSec=5
+
+# ── Hardening (least privilege) ──────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# V8's JIT needs writable+executable pages, so W^X cannot be enforced here.
+MemoryDenyWriteExecute=false
+# The relay writes nothing to disk; no ReadWritePaths needed.
+
+[Install]
+WantedBy=multi-user.target

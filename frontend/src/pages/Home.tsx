@@ -26,9 +26,8 @@ export default function Home() {
                     <span className="mode-card-icon">🌐</span>
                     <h2>Remote Transfer</h2>
                     <p>
-                        Share files with anyone on the internet via WebRTC DataChannels.
-                        A lightweight signaling server relays only the connection handshake
-                        — your file bytes stay P2P.
+                        Share files with anyone on the internet via a small cloud relay.
+                        End-to-end encrypted — the relay forwards ciphertext only.
                     </p>
                     <span className="badge">Any Network</span>
                 </Link>

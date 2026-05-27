@@ -51,6 +51,7 @@ class AgentSocket {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 
     try {
+      console.log(AGENT_WS_URL)
       this.ws = new WebSocket(AGENT_WS_URL);
     } catch (err) {
       // WebSocket constructor throws synchronously for invalid URLs

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import type { Peer, Transfer } from '../types';
+import type { Transfer } from '../types';
 import DeviceCard from '../components/DeviceCard';
 import ProgressBar from '../components/ProgressBar';
 import IncomingTransferModal from '../components/IncomingTransferModal';
@@ -7,30 +7,22 @@ import { formatBytes, formatState, formatSpeed, formatETA } from '../lib/utils';
 import { useRemoteTransfer } from '../hooks/useRemoteTransfer';
 import { useToast } from '../lib/toast';
 
-interface RemoteProps {
-    peers?: Peer[];
-    transfers?: Map<string, Transfer>;
-    agentConnected?: boolean;
-    onSendFile?: (peerId: string, file: File) => void;
-}
-
 interface SpeedSample {
     lastChunks: number;
     lastAt: number;
     bytesPerSec: number;
 }
 
-export default function Remote(_props: RemoteProps) {
+export default function Remote() {
     const { addToast } = useToast();
-    const [selectedPeer, setSelectedPeer] = React.useState<Peer | null>(null);
+    const [selectedPeer, setSelectedPeer] = React.useState(false);
     const [dragging, setDragging] = React.useState(false);
     const [inputShareCode, setInputShareCode] = React.useState('');
-    const fileInputRef = React.useRef<HTMLInputElement>(null);
-
+    const fileInputRef = useRef<HTMLInputElement>(null);
     const speedSamples = useRef<Map<string, SpeedSample>>(new Map());
 
     const {
-        shareCode: localShareCode,
+        shareCode,
         remotePeer,
         transfers,
         incomingTransfer,
@@ -41,33 +33,37 @@ export default function Remote(_props: RemoteProps) {
         acceptRemoteTransfer,
         rejectRemoteTransfer,
         dismissIncoming,
-        disconnect
+        disconnect,
     } = useRemoteTransfer();
 
     useEffect(() => {
-        if (lastError) {
-            addToast(lastError, 'error');
-        }
+        if (lastError) addToast(lastError, 'error');
     }, [lastError, addToast]);
 
-    // createRoom on mount so user has a share code ready; disconnect on unmount tears down P2P + IndexedDB buffers + revoke timers
+    // Auto-create a room on mount so the user has a share code ready; tear the
+    // relay connection (and any in-flight receive) down on unmount.
     useEffect(() => {
         createRoom();
         return () => disconnect();
     }, [createRoom, disconnect]);
+
+    // When the peer connects, surface the send panel; clear it when they leave.
+    useEffect(() => {
+        setSelectedPeer(remotePeer !== null);
+    }, [remotePeer]);
 
     function handleFileDrop(e: React.DragEvent) {
         e.preventDefault();
         setDragging(false);
         if (!remotePeer) return;
         const file = e.dataTransfer.files[0];
-        if (file) sendRemoteFile(file);
+        if (file) void sendRemoteFile(file);
     }
 
     function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
         if (!remotePeer) return;
         const file = e.target.files?.[0];
-        if (file) sendRemoteFile(file);
+        if (file) void sendRemoteFile(file);
         e.target.value = '';
     }
 
@@ -88,7 +84,6 @@ export default function Remote(_props: RemoteProps) {
                 sample.lastAt = now;
             }
         }
-        // chunksReceived can sit at 0 for several seconds while ECDH completes — avoid showing "0 B/s" then
         if (sample.bytesPerSec === 0) return null;
         const remaining = (t.totalChunks - t.chunksReceived) * chunkBytes;
         return { speed: formatSpeed(sample.bytesPerSec), eta: formatETA(remaining, sample.bytesPerSec) };
@@ -102,8 +97,9 @@ export default function Remote(_props: RemoteProps) {
             <div className="page-header">
                 <h1>🌐 Remote Transfer</h1>
                 <p>
-                    Send files to peers on any network using WebRTC DataChannels.
-                    A tiny signaling server only relays the connection handshake — your file bytes are always P2P.
+                    Send files to anyone on the internet through an encrypted cloud relay.
+                    File contents are end-to-end encrypted (ECDH + AES-256-GCM) — the relay
+                    forwards ciphertext only and never sees your file's bytes.
                 </p>
             </div>
 
@@ -128,13 +124,15 @@ export default function Remote(_props: RemoteProps) {
                             fontFamily: 'inherit',
                             fontSize: '0.9rem',
                             outline: 'none',
+                            letterSpacing: '1px',
+                            textTransform: 'uppercase',
                         }}
                     />
                     <button
                         id="remote-connect-btn"
                         className="btn btn-primary"
                         disabled={!inputShareCode.trim()}
-                        onClick={() => { joinRoom(inputShareCode.trim()); }}
+                        onClick={() => joinRoom(inputShareCode.trim())}
                     >
                         Connect
                     </button>
@@ -142,17 +140,17 @@ export default function Remote(_props: RemoteProps) {
                 <p style={{ marginTop: '8px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                     Share your code with the other person:{' '}
                     <strong style={{ color: 'var(--accent)', letterSpacing: '1px' }}>
-                        {localShareCode || 'Generating...'}
+                        {shareCode || 'Generating…'}
                     </strong>
                 </p>
             </div>
 
-            {remotePeers.length > 0 && (
+            {remotePeers.length > 0 ? (
                 <div className="section">
                     <div className="section-header">
                         <span className="section-title">
-                            Remote Peers
-                            <span style={{ background: 'var(--bg-elevated)', borderRadius: '99px', padding: '1px 8px', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                            Remote Peer
+                            <span style={{ background: 'var(--bg-elevated)', borderRadius: '99px', padding: '1px 8px', fontSize: '0.75rem', color: 'var(--text-secondary)', marginLeft: '8px' }}>
                                 {remotePeers.length}
                             </span>
                         </span>
@@ -162,33 +160,28 @@ export default function Remote(_props: RemoteProps) {
                             <DeviceCard
                                 key={peer.id}
                                 peer={peer}
-                                selected={selectedPeer?.id === peer.id}
-                                onClick={() => setSelectedPeer((prev) => (prev?.id === peer.id ? null : peer))}
+                                selected={selectedPeer}
+                                onClick={() => setSelectedPeer((prev) => !prev)}
                             />
                         ))}
                     </div>
                 </div>
-            )}
-
-            {remotePeers.length === 0 && (
+            ) : (
                 <div className="section">
                     <div className="empty-state">
                         <div className="empty-icon">🌍</div>
-                        <p>No remote peers connected yet.</p>
+                        <p>No remote peer connected yet.</p>
                         <p style={{ marginTop: '4px' }}>Share your code or enter a peer's code above.</p>
                     </div>
                 </div>
             )}
 
-            {selectedPeer && (
+            {remotePeer && selectedPeer && (
                 <div className="section">
                     <div className="section-header">
                         <span className="section-title">
-                            Send to <strong style={{ color: 'var(--accent)' }}>{selectedPeer.name}</strong>
+                            Send to <strong style={{ color: 'var(--accent)' }}>{remotePeer.name}</strong>
                         </span>
-                        <button className="btn btn-outline btn-sm" onClick={() => setSelectedPeer(null)}>
-                            ✕ Deselect
-                        </button>
                     </div>
 
                     <div

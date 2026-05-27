@@ -9,6 +9,10 @@
 #   For LAN peer discovery on Linux, uncomment `network_mode: host`
 #   on the backend service. macOS/Windows Docker Desktop users must
 #   run the backend natively for LAN mode.
+#
+# Remote mode:
+#   Not deployed via this compose file. The Remote-mode relay is a
+#   separate service intended for cloud hosting (see deploy/ once added).
 
 name: nexdrop
 
@@ -28,19 +32,14 @@ services:
     ports:
       - "${TCP_PORT:-4000}:4000"        # LAN TCP transfers
       - "${WS_API_PORT:-4001}:4001"     # Browser ↔ agent bridge (localhost-only in prod)
-      - "${SIGNALING_PORT:-4002}:4002"  # WebRTC signaling
 
     environment:
       TCP_PORT: ${TCP_PORT:-4000}
       WS_API_PORT: ${WS_API_PORT:-4001}
-      SIGNALING_PORT: ${SIGNALING_PORT:-4002}
       DEVICE_NAME: ${DEVICE_NAME:-nexdrop-node}
       ALLOW_REMOTE_WS: ${ALLOW_REMOTE_WS:-false}
       WS_ALLOWED_ORIGIN: ${WS_ALLOWED_ORIGIN:-http://localhost:3000}
       DOWNLOAD_DIR: ${DOWNLOAD_DIR:-/downloads/NexDrop}
-      SIGNALING_MAX_CONN_PER_IP: ${SIGNALING_MAX_CONN_PER_IP:-5}
-      SIGNALING_MAX_MSG_PER_SEC: ${SIGNALING_MAX_MSG_PER_SEC:-20}
-      SIGNALING_ROOM_TTL_MS: ${SIGNALING_ROOM_TTL_MS:-600000}
 
     volumes:
       - downloads:/downloads/NexDrop
@@ -66,11 +65,8 @@ services:
       args:
         # VITE_* vars are baked in at build time — set to production URLs
         VITE_AGENT_WS_URL: ${VITE_AGENT_WS_URL:-ws://localhost:4001}
-        VITE_SIGNALING_URL: ${VITE_SIGNALING_URL:-ws://localhost:4002}
-        VITE_STUN_SERVERS: ${VITE_STUN_SERVERS:-stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302}
-        VITE_TURN_SERVER_URL: ${VITE_TURN_SERVER_URL:-}
-        VITE_TURN_USERNAME: ${VITE_TURN_USERNAME:-}
-        VITE_TURN_CREDENTIAL: ${VITE_TURN_CREDENTIAL:-}
+        # Remote relay is deployed separately (see deploy/); point this at it.
+        VITE_RELAY_URL: ${VITE_RELAY_URL:-ws://localhost:4002}
     image: nexdrop-frontend:latest
     container_name: nexdrop-frontend
 

@@ -8,6 +8,8 @@
     "dev": "nodemon",
     "build": "tsc",
     "start": "node dist/index.js",
+    "relay": "node dist/relay.js",
+    "relay:dev": "nodemon --watch src --ext ts,json --exec \"ts-node --project tsconfig.json src/relay.ts\"",
     "typecheck": "tsc --noEmit",
     "test": "jest"
   },

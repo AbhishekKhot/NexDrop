@@ -1,0 +1,34 @@
+# NexDrop Remote Relay — Caddy reverse proxy
+#
+# Caddy terminates TLS (automatic Let's Encrypt certs) and proxies the
+# WebSocket upgrade to the relay listening on loopback. The relay itself never
+# faces the internet directly.
+#
+# Replace relay.example.com with your domain and reload:
+#   sudo caddy reload --config /etc/caddy/Caddyfile
+
+relay.example.com {
+	# Proxy everything (including the WS upgrade) to the loopback-bound relay.
+	# flush_interval -1 disables response buffering so any streamed bytes are
+	# forwarded immediately (belt-and-suspenders; WS is already bidirectional).
+	reverse_proxy 127.0.0.1:4002 {
+		flush_interval -1
+	}
+
+	# No `encode` directive: file chunks are AES-GCM ciphertext (incompressible),
+	# so compression would only burn CPU.
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		# Don't advertise the server software.
+		-Server
+	}
+
+	# Keep access logs but never log request bodies.
+	log {
+		output file /var/log/caddy/relay-access.log
+		format json
+	}
+}

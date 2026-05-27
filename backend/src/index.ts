@@ -3,12 +3,10 @@ import os from "os";
 import { MdnsService } from "./discovery/mdns";
 import { createTcpServer, PendingDecisionMap } from "./transport/tcpServer";
 import { sendFileToPeer } from "./transport/tcpClient";
-import { createSignalingServer } from "./transport/signalingServer";
 import { WsApiServer } from "./api/wsApi";
 import {
   TCP_PORT,
   WS_API_PORT,
-  SIGNALING_PORT,
   DEVICE_NAME,
   DOWNLOAD_DIR,
 } from "./config";
@@ -123,8 +121,6 @@ async function main(): Promise<void> {
     (transfer) => wsApi.broadcast({ type: "transfer_update", transfer }),
   );
 
-  createSignalingServer();
-
   const ifaces = os.networkInterfaces();
   const lanIps: string[] = [];
   for (const iface of Object.values(ifaces)) {
@@ -142,7 +138,6 @@ async function main(): Promise<void> {
 ╠══════════════════════════════════════════════════                               ╣
 ║  TCP receiver   :${String(TCP_PORT).padEnd(5)} (LAN file transfers)             ║
 ║  WS API         :${String(WS_API_PORT).padEnd(5)} (browser UI bridge)           ║
-║  Signaling      :${String(SIGNALING_PORT).padEnd(5)} (WebRTC relay, E2EE)       ║
 ╠══════════════════════════════════════════════════                               ╣
 ║  Browser → ws://localhost:${String(WS_API_PORT).padEnd(22)}                     ║
 ║  Tunnel: ALLOW_REMOTE_WS=true npm run dev                                       ║
