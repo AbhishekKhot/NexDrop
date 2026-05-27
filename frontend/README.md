@@ -1,6 +1,6 @@
 # NexDrop — Frontend
 
-React 19 + Vite + TypeScript web UI for LAN and Remote peer-to-peer file transfer.
+React 19 + Vite + TypeScript web UI for NexDrop's LAN (direct peer-to-peer) and Remote (relayed, end-to-end encrypted) file transfer.
 
 - **LAN mode** talks to a local NexDrop agent over WebSocket (`ws://localhost:4001`).
 - **Remote mode** talks to a WebSocket **relay** (`ws://localhost:4002` in dev, `wss://…` in prod), which pairs two browsers by share code and forwards end-to-end-encrypted file chunks. See [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
@@ -83,6 +83,7 @@ src/
 └── lib/
     ├── agentSocket.ts          Singleton agent WebSocket client (LAN)
     ├── remoteCrypto.ts         Web Crypto: ECDH P-256, AES-256-GCM, HKDF
+    ├── remoteStatus.ts         Relay/peer status store for the header indicator
     ├── toast.tsx               Toast notifications
     └── utils.ts                formatBytes, formatState, formatSpeed, formatETA
 ```

@@ -1,5 +1,11 @@
 # Deploying the NexDrop Remote Relay
 
+> **New to this?** For a complete, beginner-friendly Oracle Cloud walkthrough —
+> account creation, domain, firewall, and **hosting the frontend + relay on one
+> VM/domain** — follow [../DEPLOYMENT.md](../DEPLOYMENT.md). This page is the
+> **concise config reference** for the **relay-only** topology (frontend hosted
+> separately on a static host).
+
 The relay is the only server-side component of Remote mode. It pairs two
 browsers and pipes end-to-end-encrypted file chunks between them — it never sees
 plaintext (see [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md)). It is

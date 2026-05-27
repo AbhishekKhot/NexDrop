@@ -14,7 +14,6 @@ No accounts. No stored files. On a LAN, bytes travel directly between peers. Acr
 - [Architecture Overview (HLD)](#architecture-overview-hld)
   - [LAN Mode](#lan-mode)
   - [Remote Mode](#remote-mode)
-- [UI Wireframes](#ui-wireframes)
 - [Security Model](#security-model)
 
 ---
@@ -148,7 +147,7 @@ sequenceDiagram
         RA->>SA: TCP: ACCEPT
         loop Each 256 KB chunk
             SA->>SA: AES-256-GCM encrypt chunk
-            SA->>RA: TCP: CHUNK frame (JSON + base64)
+            SA->>RA: TCP: CHUNK frame (binary: IV + tag + ciphertext)
             RA->>RA: Decrypt + verify SHA-256
             RA-->>RB: WS: transfer_update (progress)
         end
@@ -212,73 +211,6 @@ sequenceDiagram
     end
     S->>R: transfer_end
     R->>T: transfer_end  (assert N chunks → finalise download)
-```
-
----
-
-## UI Wireframes
-
-### Home Page — Mode Selection
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                        NexDrop                          │
-│              Secure Peer-to-Peer File Transfer           │
-│                                                         │
-│   ┌──────────────────────┐  ┌──────────────────────┐   │
-│   │                      │  │                      │   │
-│   │    ◎  LAN Mode        │  │    ◉  Remote Mode     │   │
-│   │                      │  │                      │   │
-│   │  Same network only   │  │   Any network, any   │   │
-│   │  Fastest transfer    │  │   device worldwide   │   │
-│   │  Auto-discovery      │  │   Share code needed  │   │
-│   │                      │  │                      │   │
-│   └──────────────────────┘  └──────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Remote Page — Share Code & Send
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  ← Back          NexDrop — Remote          ● Relay     │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  Your Share Code                                        │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │              7 G 4 Q X 2 M K 9 A                │   │
-│  │                                         [Copy]  │   │
-│  └─────────────────────────────────────────────────┘   │
-│  Share this code with the other device.                 │
-│                                                         │
-│  ─── OR join an existing session ───                    │
-│                                                         │
-│  ┌─────────────────────────────────┐  [Connect]        │
-│  │  Enter share code...            │                    │
-│  └─────────────────────────────────┘                    │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  ● Peer Connected — Ready to transfer                   │
-│                                                         │
-│  Drop files here or click to browse                     │
-│  Receiving: document.pdf    ████████████░░░  75%        │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Incoming Transfer Modal
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                  Incoming File Transfer                  │
-│                                                         │
-│   From:   Remote Peer                                   │
-│   File:   vacation-photos.zip                           │
-│   Size:   247 MB                                        │
-│                                                         │
-│   ┌───────────────────┐   ┌─────────────────────────┐  │
-│   │     ✓ Accept       │   │       ✗ Reject           │  │
-│   └───────────────────┘   └─────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
 ```
 
 ---
