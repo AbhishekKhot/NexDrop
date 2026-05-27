@@ -99,6 +99,10 @@ export function useRemoteTransfer(): RemoteTransferState {
   const [lastError, setLastError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  // Serializes incoming-message processing in strict arrival order. Both
+  // handlers are async (key gate, decrypt, disk write); without this a trailing
+  // transfer_end could finalize before an in-flight chunk is counted.
+  const processingChainRef = useRef<Promise<void>>(Promise.resolve());
   // 'create' | { join: code } — applied once the welcome handshake completes.
   const pendingIntentRef = useRef<'create' | { join: string } | null>(null);
   const relayMaxFileSizeRef = useRef<number>(BLOB_MAX_FILE_SIZE);
@@ -428,23 +432,31 @@ export function useRemoteTransfer(): RemoteTransferState {
         /* already closed */
       }
       pendingIntentRef.current = intent;
+      processingChainRef.current = Promise.resolve();
       const ws = new WebSocket(RELAY_URL);
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
       ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', v: PROTOCOL_VERSION }));
       ws.onmessage = (event) => {
-        if (typeof event.data === 'string') {
-          let msg: Record<string, unknown>;
-          try {
-            msg = JSON.parse(event.data);
-          } catch {
-            return;
-          }
-          void handleControl(msg);
-        } else if (event.data instanceof ArrayBuffer) {
-          void handleBinary(event.data);
-        }
+        const { data } = event;
+        // Chain so each message fully processes before the next — preserves
+        // transfer_begin → chunks → transfer_end ordering across async handlers.
+        processingChainRef.current = processingChainRef.current
+          .then(() => {
+            if (typeof data === 'string') {
+              let msg: Record<string, unknown>;
+              try {
+                msg = JSON.parse(data);
+              } catch {
+                return undefined;
+              }
+              return handleControl(msg);
+            }
+            if (data instanceof ArrayBuffer) return handleBinary(data);
+            return undefined;
+          })
+          .catch((err) => console.error('[Remote] message handler error', err));
       };
       ws.onerror = () => setLastError('Relay connection error');
       ws.onclose = () => {
