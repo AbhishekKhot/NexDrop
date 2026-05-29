@@ -1,10 +1,12 @@
 # ============================================================
-#  NexDrop Backend Agent — Dockerfile
+#  NexDrop Relay — Dockerfile
 #  Multi-stage: build TypeScript → lean production image
+#  Mirrors deploy/Dockerfile.relay; this one is wired into
+#  the repo-root docker-compose.yml. Keep them in sync.
 # ============================================================
 
 # ── Stage 1: Build ────────────────────────────────────────────────────
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -17,32 +19,30 @@ COPY src/ ./src/
 RUN npm run build
 
 # ── Stage 2: Production runner ────────────────────────────────────────
-FROM node:18-alpine AS runner
+FROM node:20-alpine AS runner
 
-# Non-root user for security
+# Non-root user (defense-in-depth even though the container is sandboxed)
 RUN addgroup -S nexdrop && adduser -S nexdrop -G nexdrop
 
 WORKDIR /app
 
 ENV NODE_ENV=production
+# In a container the relay must bind all interfaces; the host exposes only
+# loopback by default in docker-compose.yml (or sits behind a proxy in prod).
+ENV RELAY_BIND_HOST=0.0.0.0
 
-# Install only production dependencies
+# Install only production dependencies (drops jest, ts-node, nodemon, etc.)
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy compiled output
 COPY --from=builder /app/dist ./dist
 
-# Create downloads directory (overridden by DOWNLOAD_DIR env var)
-RUN mkdir -p /downloads/NexDrop && chown -R nexdrop:nexdrop /downloads/NexDrop
-
 USER nexdrop
 
-# TCP (LAN transfers) | WS API (browser bridge).
-# The Remote relay is a separate service — see deploy/Dockerfile.relay.
-EXPOSE 4000 4001
+EXPOSE 4002
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD node -e "require('net').connect(parseInt(process.env.WS_API_PORT||'4001'),'localhost',()=>process.exit(0)).on('error',()=>process.exit(1))"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:'+(process.env.RELAY_PORT||'4002')+'/', r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/relay.js"]

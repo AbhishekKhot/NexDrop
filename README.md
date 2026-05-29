@@ -1,8 +1,10 @@
 # NexDrop
 
-> Encrypted file transfer — direct on your LAN, or internet-wide via an encrypted relay.
+> **Instant file sharing — no accounts, no installs, no servers see your bytes.**
 
-No accounts. No stored files. On a LAN, bytes travel directly between peers. Across the internet, bytes pass through a thin relay that only ever sees ciphertext — file **contents** are end-to-end encrypted in both modes.
+Two browsers, one share code, a file moves. The relay in the middle pairs the two
+sides and forwards opaque ciphertext — it never sees the file contents or the
+encryption key.
 
 ---
 
@@ -11,10 +13,9 @@ No accounts. No stored files. On a LAN, bytes travel directly between peers. Acr
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
 - [Quick Start](#quick-start)
-- [Architecture Overview (HLD)](#architecture-overview-hld)
-  - [LAN Mode](#lan-mode)
-  - [Remote Mode](#remote-mode)
+- [Architecture Overview](#architecture-overview)
 - [Security Model](#security-model)
+- [LAN feature (disabled)](#lan-feature-disabled)
 
 ---
 
@@ -22,28 +23,30 @@ No accounts. No stored files. On a LAN, bytes travel directly between peers. Acr
 
 ```
 NexDrop/
-├── backend/                ← Node.js + TypeScript
+├── backend/                ← Node.js + TypeScript (relay only)
 │   ├── src/
-│   │   ├── api/            ← WebSocket bridge (browser ↔ LAN agent)
-│   │   ├── chunking/       ← Chunk assembler & disassembler (LAN)
-│   │   ├── crypto/         ← ECDH + AES-256-GCM (LAN)
-│   │   ├── discovery/      ← mDNS peer discovery (LAN)
-│   │   ├── transport/      ← TCP client/server (LAN) + relayServer (Remote)
-│   │   ├── index.ts        ← LAN agent entry point
-│   │   └── relay.ts        ← Remote relay entry point (deployed separately)
-│   └── README.md           ← Backend setup & protocol reference
+│   │   ├── relay.ts        ← Remote relay entry point
+│   │   ├── transport/
+│   │   │   └── relayServer.ts   ← rooms, pairing, E2EE chunk forwarding
+│   │   └── config.ts       ← RELAY_* env vars (LAN constants commented out)
+│   └── README.md
 ├── frontend/               ← React 19 + Vite + TypeScript
 │   ├── src/
-│   │   ├── components/     ← DeviceCard, ProgressBar, IncomingTransferModal
-│   │   ├── hooks/          ← useAgentSocket (LAN), useRemoteTransfer (Remote)
-│   │   ├── lib/            ← agentSocket, remoteCrypto
-│   │   └── pages/          ← Home, Lan, Remote
-│   └── README.md           ← Frontend setup & component guide
+│   │   ├── App.tsx         ← Single route → Remote page
+│   │   ├── pages/Remote.tsx
+│   │   ├── hooks/useRemoteTransfer.ts
+│   │   ├── lib/remoteCrypto.ts
+│   │   └── lib/remoteStatus.ts
+│   └── README.md
 ├── docs/
-│   └── RELAY_PROTOCOL.md   ← Remote relay wire-protocol spec
+│   └── RELAY_PROTOCOL.md   ← Relay wire-protocol spec
 ├── deploy/                 ← Relay deployment (Caddy, systemd, Docker)
-├── docker-compose.yml
-└── .env.example
+├── DEPLOYMENT.md           ← Oracle Cloud Free Tier walkthrough (VM)
+├── DEPLOYMENT-RENDER.md    ← Render free tier (PaaS) walkthrough
+├── DEPLOYMENT-CLOUDFLARE-PAGES.md   ← Frontend on Cloudflare Pages
+├── DEPLOYMENT-GITHUB-PAGES.md       ← Frontend on GitHub Pages
+├── docker-compose.yml      ← relay + frontend in containers (local dev)
+└── render.yaml             ← One-click relay Blueprint
 ```
 
 ---
@@ -52,124 +55,52 @@ NexDrop/
 
 | Layer | Technology |
 |---|---|
-| Backend runtime | Node.js 18+, TypeScript 5.8 |
+| Relay | Node.js 18+, TypeScript 5.8, `ws` |
 | Frontend | React 19, Vite 7, TypeScript 5.9 |
-| LAN transport | TCP (Node `net`), mDNS / Bonjour |
-| Remote transport | WebSocket relay (`ws` / `wss`) |
-| LAN encryption | ECDH P-256 → HKDF → AES-256-GCM + SHA-256 |
-| Remote encryption | ECDH P-256 → HKDF-SHA256 → AES-256-GCM (file contents, E2E) |
-| LAN discovery | mDNS service type `peerdrop._tcp` |
-| Remote discovery | Relay rooms + 10-char share codes |
-| Remote large files | File System Access API (stream to disk) / Blob fallback |
+| Transport | WebSocket relay (`ws` / `wss`) |
+| Encryption | ECDH P-256 → HKDF-SHA256 → AES-256-GCM (file contents, E2E) |
+| Pairing | 10-char Crockford Base32 share code (50 bits entropy) |
+| Large files | File System Access API (stream to disk) / Blob fallback |
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone and enter project root
+# 1. Clone
 git clone <repo> && cd NexDrop
 
-# 2. LAN mode — start the agent (new terminal)
+# 2. Start the relay (new terminal)
 cd backend && npm install && npm run dev
 
-# 3. Remote mode — start the relay (new terminal)
-cd backend && npm run relay:dev
-
-# 4. Start the frontend (new terminal)
+# 3. Start the frontend (new terminal)
 cd frontend && npm install && npm run dev
 ```
 
 - Frontend: http://localhost:5173
-- LAN agent WebSocket: ws://localhost:4001
-- Remote relay WebSocket: ws://localhost:4002
+- Relay WebSocket: ws://localhost:4002
 
-The LAN agent (`npm run dev`) and the relay (`npm run relay:dev`) are independent
-processes — run only what you need. See [backend/README.md](backend/README.md)
-and [frontend/README.md](frontend/README.md) for full setup, and
-[deploy/README.md](deploy/README.md) to host the relay in the cloud.
+Open the frontend in two browsers, copy the share code from one into the
+other, and drop a file in.
 
----
+**Deploying to the cloud (Remote relay):**
 
-## Architecture Overview (HLD)
+- [DEPLOYMENT.md](DEPLOYMENT.md) — Oracle Cloud Free Tier VM (always-on)
+- [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md) — Render PaaS (click-deploy, sleeps after 15 min idle)
 
-### LAN Mode
+**Deploying the frontend (static SPA):**
 
-Devices on the same network communicate via TCP with mDNS auto-discovery. The browser delegates all networking to a local Node.js agent running on the same machine.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                       Machine A                             │
-│  ┌─────────────┐   WS (4001)   ┌───────────────────────┐   │
-│  │   Browser   │◄─────────────►│     NexDrop Agent      │   │
-│  │  (React UI) │               │  ┌──────────────────┐  │   │
-│  └─────────────┘               │  │  mDNS Discovery  │  │   │
-│                                │  │  TCP Server :4000│  │   │
-│                                │  │  TCP Client      │  │   │
-│                                │  └──────────────────┘  │   │
-│                                └──────────┬────────────┘   │
-└───────────────────────────────────────────┼─────────────────┘
-                                            │ TCP :4000
-                              ECDH + AES-256-GCM encrypted
-                                            │
-┌───────────────────────────────────────────┼─────────────────┐
-│                       Machine B           │                  │
-│                                ┌──────────▼────────────┐   │
-│  ┌─────────────┐   WS (4001)   │     NexDrop Agent      │   │
-│  │   Browser   │◄─────────────►│  ┌──────────────────┐  │   │
-│  │  (React UI) │               │  │  TCP Server :4000│  │   │
-│  └─────────────┘               │  │  mDNS Discovery  │  │   │
-│                                │  └──────────────────┘  │   │
-│                                └───────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                    ▲                      ▲
-                    └──── mDNS multicast ──┘
-                         (auto-discovery)
-```
-
-```mermaid
-sequenceDiagram
-    participant SB as Sender Browser
-    participant SA as Sender Agent :4001
-    participant RA as Receiver Agent :4000
-    participant RB as Receiver Browser
-
-    Note over SA,RA: mDNS auto-discovery (background)
-
-    SB->>SA: WS: send_file_start + binary chunks
-    SA->>SA: Buffer chunks in memory
-    SA->>RA: TCP connect + ECDH key exchange
-    SA->>RA: METADATA frame (fileName, hash, pubKey)
-    RA-->>RB: WS: transfer_offer modal
-
-    alt User accepts
-        RB->>RA: WS: accept_transfer
-        RA->>SA: TCP: ACCEPT
-        loop Each 256 KB chunk
-            SA->>SA: AES-256-GCM encrypt chunk
-            SA->>RA: TCP: CHUNK frame (binary: IV + tag + ciphertext)
-            RA->>RA: Decrypt + verify SHA-256
-            RA-->>RB: WS: transfer_update (progress)
-        end
-        SA->>RA: TCP: DONE
-        RA->>RA: Verify full-file SHA-256
-        RA->>RA: Write file to ~/Downloads/NexDrop
-    else User rejects
-        RB->>RA: WS: reject_transfer
-        RA->>SA: TCP: REJECT → close
-    end
-```
+- [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md) — Cloudflare Pages (unlimited bandwidth)
+- [DEPLOYMENT-GITHUB-PAGES.md](DEPLOYMENT-GITHUB-PAGES.md) — GitHub Pages (zero setup)
 
 ---
 
-### Remote Mode
+## Architecture Overview
 
-Devices on different networks connect through a small WebSocket **relay**. The
-relay pairs the two browsers by share code and forwards opaque, end-to-end
-encrypted chunks between them. It never sees file contents or the encryption
-key — only ciphertext bytes, sizes, file name, and timing. There is no agent in
-the Remote data path; both ends are pure browser. Full spec:
-[docs/RELAY_PROTOCOL.md](docs/RELAY_PROTOCOL.md).
+Two browsers connect to a small WebSocket **relay** over `wss://`. The relay
+pairs them by share code and forwards opaque, end-to-end-encrypted chunks
+between them. **It performs zero crypto and never sees plaintext** — only
+ciphertext bytes, sizes, file name, timing, and peer IPs.
 
 ```
 Sender Browser ─── wss ───► Relay (cloud) ─── wss ───► Receiver Browser
@@ -213,23 +144,43 @@ sequenceDiagram
     R->>T: transfer_end  (assert N chunks → finalise download)
 ```
 
+Full wire-protocol spec: [docs/RELAY_PROTOCOL.md](docs/RELAY_PROTOCOL.md).
+
 ---
 
 ## Security Model
 
-| Property | LAN Mode | Remote Mode |
-|---|---|---|
-| Topology | Direct peer-to-peer (TCP) | Relayed (server in the byte path) |
-| Key exchange | ECDH P-256 (per transfer) | ECDH P-256 (per pairing) |
-| Content encryption | AES-256-GCM | AES-256-GCM (per chunk, end-to-end) |
-| Integrity | SHA-256 per chunk + full file | AES-GCM tag per chunk + index + count |
-| Forward secrecy | Yes (ephemeral key pair) | Yes (ephemeral key pair) |
-| Relay sees file **contents** | N/A (no relay) | Never (ciphertext only) |
-| Relay sees **metadata** | N/A | File name, size, timing, peer IPs |
-| Transport security | LAN TCP | `wss://` (TLS) to the relay |
-| Auth required | None (by design) | None — share code is the capability |
+| Property | Value |
+|---|---|
+| Topology | Relayed (server in the byte path) |
+| Key exchange | ECDH P-256 (per pairing, ephemeral) |
+| Content encryption | AES-256-GCM (per chunk, end-to-end) |
+| Integrity | AES-GCM tag per chunk + monotonic 4-byte index + totalChunks count |
+| Forward secrecy | Yes (ephemeral key pair per pairing) |
+| Relay sees file **contents** | Never (ciphertext only) |
+| Relay sees **metadata** | File name, size, timing, peer IPs |
+| Transport security | `wss://` (TLS) to the relay |
+| Auth required | None — share code is the capability (50 bits entropy) |
+| Origin check on WS upgrade | Yes (CWE-352 / CSWSH) |
+| Rate limiting | Per-IP connection cap + per-conn token bucket + failed-join limit |
+| Resource bounds | 5 GiB byte cap per transfer, room TTLs, control-frame cap |
 
-Remote mode is **end-to-end encrypted but server-relayed** — it is not pure P2P.
+**Remote mode is end-to-end encrypted but server-relayed — it is not pure P2P.**
 Only file contents are encrypted; file name and size travel as plaintext
 metadata visible to the relay (a deliberate v1 trade-off — see
 [docs/RELAY_PROTOCOL.md §12](docs/RELAY_PROTOCOL.md)).
+
+---
+
+## LAN feature (disabled)
+
+A direct LAN mode (mDNS discovery + raw TCP between peers on the same network)
+was previously part of NexDrop. It is currently **line-commented in place**,
+not deleted — the original files are preserved in:
+
+- `backend/src/{index.ts,api,discovery,transport/tcp*,chunking,crypto}.ts`
+- `frontend/src/{hooks/useAgentSocket.ts,lib/agentSocket.ts,pages/Lan.tsx,pages/Home.tsx}`
+
+Each file starts with a `LAN FEATURE — DISABLED` header that explains how to
+re-enable it (strip the leading `// ` from each line, restore the routing and
+constants noted in the header).

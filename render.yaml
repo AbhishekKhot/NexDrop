@@ -1,0 +1,38 @@
+# Render Blueprint for the NexDrop Remote relay.
+# https://render.com/docs/blueprint-spec
+#
+# Deploy:  https://dashboard.render.com/select-repo?type=blueprint
+#
+# After first deploy, set RELAY_ALLOWED_ORIGIN in the Render dashboard to the
+# exact origin your frontend is served from (e.g. https://nexdrop.pages.dev).
+# The relay refuses any WebSocket upgrade from another origin (CWE-352).
+#
+# This blueprint deploys ONLY the relay. Host the frontend separately on
+# Cloudflare Pages / Vercel / Netlify (static, free). The LAN agent is a local
+# install on each user's machine and is not deployable to Render.
+
+services:
+  - type: web
+    name: nexdrop-relay
+    runtime: node
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/relay.js
+    healthCheckPath: /
+    envVars:
+      # Render injects PORT dynamically; the relay reads it via config.ts.
+      # Bind to 0.0.0.0 so Render's edge proxy can reach the process.
+      - key: RELAY_BIND_HOST
+        value: 0.0.0.0
+      # Render terminates TLS and forwards client IP via X-Forwarded-For.
+      # Required for per-IP rate limiting to see real client IPs (CWE-348).
+      - key: RELAY_TRUST_PROXY
+        value: "true"
+      # MUST be set manually in the Render dashboard to your frontend's exact
+      # origin (scheme + host + optional port). No default — fail closed.
+      - key: RELAY_ALLOWED_ORIGIN
+        sync: false
+      - key: NODE_ENV
+        value: production
