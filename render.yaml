@@ -18,7 +18,12 @@ services:
     plan: free
     region: oregon
     rootDir: backend
-    buildCommand: npm ci && npm run build
+    # --include=dev forces TypeScript and the rest of devDependencies to
+    # install during build even when NODE_ENV=production is in scope (the
+    # default `npm ci` skips them under that env, which makes `tsc` fall back
+    # to whatever globally-installed compiler Render's image happens to ship
+    # and emits a TS-version mismatch on `ignoreDeprecations`).
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: node dist/relay.js
     healthCheckPath: /
     envVars:

@@ -162,16 +162,3 @@ metadata visible to the relay (a deliberate v1 trade-off — see
 [docs/RELAY_PROTOCOL.md §12](docs/RELAY_PROTOCOL.md)).
 
 ---
-
-## LAN feature (disabled)
-
-A direct LAN mode (mDNS discovery + raw TCP between peers on the same network)
-was previously part of NexDrop. It is currently **line-commented in place**,
-not deleted — the original files are preserved in:
-
-- `backend/src/{index.ts,api,discovery,transport/tcp*,chunking,crypto}.ts`
-- `frontend/src/{hooks/useAgentSocket.ts,lib/agentSocket.ts,pages/Lan.tsx,pages/Home.tsx}`
-
-Each file starts with a `LAN FEATURE — DISABLED` header that explains how to
-re-enable it (strip the leading `// ` from each line, restore the routing and
-constants noted in the header).
