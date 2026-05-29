@@ -102,11 +102,11 @@ export default function Remote() {
     return (
         <div>
             <div className="page-header">
-                <h1>🌐 Remote Transfer</h1>
+                <h1>NexDrop — Instant File Sharing</h1>
                 <p>
-                    Send files to anyone on the internet through an encrypted cloud relay.
-                    File contents are end-to-end encrypted (ECDH + AES-256-GCM) — the relay
-                    forwards ciphertext only and never sees your file's bytes.
+                    Send a file to anyone, anywhere. No accounts, no installs, no uploads
+                    to a server. File contents are end-to-end encrypted (ECDH + AES-256-GCM)
+                    — the relay forwards ciphertext only and never sees your bytes.
                 </p>
             </div>
 

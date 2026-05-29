@@ -12,12 +12,10 @@ FROM node:18-alpine AS builder
 WORKDIR /app
 
 # Build-time arguments — docker-compose passes these from root .env
-ARG VITE_AGENT_WS_URL=ws://localhost:4001
 ARG VITE_RELAY_URL=ws://localhost:4002
 
 # Expose as ENV so Vite's import.meta.env picks them up at build time
-ENV VITE_AGENT_WS_URL=$VITE_AGENT_WS_URL \
-    VITE_RELAY_URL=$VITE_RELAY_URL
+ENV VITE_RELAY_URL=$VITE_RELAY_URL
 
 COPY package*.json ./
 RUN npm ci

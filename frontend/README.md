@@ -1,32 +1,15 @@
 # NexDrop — Frontend
 
-React 19 + Vite + TypeScript web UI for NexDrop's LAN (direct peer-to-peer) and Remote (relayed, end-to-end encrypted) file transfer.
+React 19 + Vite + TypeScript. Single-page SPA whose only job is to pair two
+browsers through the WebSocket relay and transfer end-to-end-encrypted files
+between them. No accounts, no logins, no uploads to the app's server.
 
-- **LAN mode** talks to a local NexDrop agent over WebSocket (`ws://localhost:4001`).
-- **Remote mode** talks to a WebSocket **relay** (`ws://localhost:4002` in dev, `wss://…` in prod), which pairs two browsers by share code and forwards end-to-end-encrypted file chunks. See [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
+The frontend's only live page is the Remote share-code transfer screen. The
+former LAN mode UI (`pages/Lan.tsx`, `pages/Home.tsx`, `hooks/useAgentSocket`,
+`lib/agentSocket`) is **line-commented in place** — see file headers to
+re-enable.
 
----
-
-## Table of Contents
-
-- [Prerequisites](#prerequisites)
-- [Local Setup](#local-setup)
-- [Environment Variables](#environment-variables)
-- [Project Layout](#project-layout)
-- [Pages](#pages)
-- [Hooks](#hooks)
-- [Core Libraries](#core-libraries)
-- [Remote Transfer Protocol (Browser Side)](#remote-transfer-protocol-browser-side)
-- [Running Tests](#running-tests)
-- [Build for Production](#build-for-production)
-
----
-
-## Prerequisites
-
-- Node.js 18 or higher, npm 9+
-- For LAN mode: a running NexDrop agent (see [../backend/README.md](../backend/README.md))
-- For Remote mode: a running relay (`npm run relay:dev` in `backend/`, or a deployed relay)
+Wire protocol: [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
 
 ---
 
@@ -35,124 +18,51 @@ React 19 + Vite + TypeScript web UI for NexDrop's LAN (direct peer-to-peer) and 
 ```bash
 cd frontend
 npm install
-cp .env.example .env      # optional for local dev
-npm run dev               # Vite dev server on http://localhost:5173
+cp .env.example .env          # optional; defaults assume relay on localhost:4002
+npm run dev                   # vite on http://localhost:5173
 ```
+
+You also need the relay running locally (`cd backend && npm run dev`).
 
 ---
 
 ## Environment Variables
 
-All frontend env vars are prefixed with `VITE_` and embedded **at build time**.
-Set them in `.env` (gitignored) or `.env.local`, and restart the dev server /
-rebuild after changing them.
+`VITE_*` vars are **baked in at build time** — restart the dev server / rebuild
+after changing them.
 
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `VITE_AGENT_WS_URL` | `ws://localhost:4001` | Local NexDrop agent (LAN mode) |
-| `VITE_RELAY_URL` | `ws://localhost:4002` | Remote-mode relay (`wss://relay.example.com` in prod) |
-
-Production example:
-
-```env
-VITE_AGENT_WS_URL=ws://localhost:4001
-VITE_RELAY_URL=wss://relay.example.com
-```
+| `VITE_RELAY_URL` | `ws://localhost:4002` | Relay endpoint. `wss://relay.example.com` in production. |
 
 ---
 
-## Project Layout
+## Source Layout
 
 ```
 src/
-├── App.tsx                     Router, global layout, IncomingTransferModal
+├── App.tsx                     Router (single route → Remote), header status
 ├── main.tsx                    React entry point
-├── types/
-│   └── index.ts                Shared types: Peer, Transfer, TransferState…
+├── types/index.ts              Peer, Transfer, TransferState (LAN message types commented)
 ├── pages/
-│   ├── Home.tsx                Mode selection (LAN vs Remote)
-│   ├── Lan.tsx                 LAN peer discovery + file send UI
-│   └── Remote.tsx              Remote share-code + relay file send UI
+│   └── Remote.tsx              Share-code pairing + send/receive UI
 ├── components/
-│   ├── DeviceCard.tsx          Peer tile (name, select/deselect)
-│   ├── IncomingTransferModal.tsx  Accept/Reject overlay for incoming files
-│   └── ProgressBar.tsx         Animated transfer progress bar
+│   ├── DeviceCard.tsx          Peer tile (single tile in Remote-only build)
+│   ├── IncomingTransferModal.tsx  Accept/Reject overlay
+│   └── ProgressBar.tsx
 ├── hooks/
-│   ├── useAgentSocket.ts       LAN: manages agent WS, peer list, send
-│   └── useRemoteTransfer.ts    Remote: relay WS, ECDH, send/receive streaming
-└── lib/
-    ├── agentSocket.ts          Singleton agent WebSocket client (LAN)
-    ├── remoteCrypto.ts         Web Crypto: ECDH P-256, AES-256-GCM, HKDF
-    ├── remoteStatus.ts         Relay/peer status store for the header indicator
-    ├── toast.tsx               Toast notifications
-    └── utils.ts                formatBytes, formatState, formatSpeed, formatETA
+│   └── useRemoteTransfer.ts    Relay WS, ECDH, chunked streaming send/receive
+├── lib/
+│   ├── remoteCrypto.ts         Web Crypto: ECDH P-256, AES-256-GCM, HKDF
+│   ├── remoteStatus.ts         Plain module store + useSyncExternalStore
+│   ├── toast.tsx               Toast notifications
+│   └── utils.ts                formatBytes, formatSpeed, formatETA…
+└── [LAN files — line-commented]
+    ├── pages/Home.tsx          Former LAN/Remote mode picker
+    ├── pages/Lan.tsx           LAN peer list + send UI
+    ├── hooks/useAgentSocket.ts Local agent WebSocket
+    └── lib/agentSocket.ts      Singleton agent WS client
 ```
-
----
-
-## Pages
-
-### Home (`/`)
-
-Mode selection — **LAN** (same network) or **Remote** (any network). Routes to `/lan` or `/remote`.
-
-### LAN (`/lan`)
-
-Discovered peers as `DeviceCard` tiles (mDNS), drag-and-drop send via the local agent, transfer history, incoming-transfer modal.
-
-### Remote (`/remote`)
-
-Auto-creates a relay room on mount and shows a 10-char share code. The other side pastes the code and connects. Once paired (and ECDH completes), drag-and-drop send works; received files stream to disk (File System Access API) or download as a Blob.
-
----
-
-## Hooks
-
-### `useAgentSocket` (LAN)
-
-Manages the singleton `AgentSocket` connection to the local agent. Reads the file, sends `send_file_start`, slices into 256 KB binary chunks (4-byte big-endian index prefix), then `send_file_end`.
-
-### `useRemoteTransfer` (Remote)
-
-Manages the relay WebSocket, ECDH key exchange, and chunked streaming. Returns:
-
-```ts
-{
-  shareCode: string | null,
-  remotePeer: Peer | null,
-  transfers: Map<string, Transfer>,
-  incomingTransfer: Transfer | null,
-  lastError: string | null,
-  createRoom: () => void,
-  joinRoom: (code: string) => void,
-  sendRemoteFile: (file: File) => void,
-  acceptRemoteTransfer: (transferId: string) => void,
-  rejectRemoteTransfer: (transferId: string) => void,
-  dismissIncoming: () => void,
-  disconnect: () => void,
-}
-```
-
----
-
-## Core Libraries
-
-### `agentSocket.ts`
-
-Singleton WebSocket client for the LAN agent: auto-reconnect, binary frame decode (4-byte big-endian index + raw bytes), outbound backpressure on `bufferedAmount`.
-
-### `remoteCrypto.ts`
-
-Browser crypto via the **Web Crypto API**, shared by the Remote path:
-
-| Function | Description |
-|---|---|
-| `generateECDHKeyPair()` | Ephemeral ECDH P-256 key pair |
-| `exportPublicKeyBase64(key)` | Serialise public key for the wire |
-| `importPublicKeyBase64(b64)` | Deserialise peer's public key |
-| `deriveSharedKey(priv, peerPub)` | ECDH → HKDF-SHA256 → AES-256-GCM `CryptoKey` |
-| `encryptChunk(key, plaintext)` | AES-256-GCM, random 12-byte IV → `[IV][ciphertext+tag]` |
-| `decryptChunk(key, encrypted)` | AES-256-GCM decrypt + implicit auth-tag check |
 
 ---
 
@@ -180,33 +90,44 @@ useRemoteTransfer
        └─ on transfer_end: assert N chunks → finalise download
 ```
 
-**Receiver capability ladder**: if `window.showSaveFilePicker` exists
+**Receiver capability ladder:** if `window.showSaveFilePicker` exists
 (Chrome/Edge), the file streams straight to disk (up to the relay's 5 GiB cap);
 otherwise it accumulates a `Blob` (capped at 2 GiB) and triggers a download.
 The browser declares its capability to the relay so the sender can pre-check.
 
-**Integrity**: per-chunk AES-GCM tag + monotonic 4-byte index + `totalChunks`
+**Integrity:** per-chunk AES-GCM tag + monotonic 4-byte index + `totalChunks`
 count. There is no full-file hash (it would require hashing the whole file in
 memory; the per-chunk guarantees already cover tamper/loss/reorder).
 
 ---
 
-## Running Tests
+## Crypto primitives (`remoteCrypto.ts`)
 
-```bash
-npm test       # vitest run
-```
+Browser Web Crypto API, wire-compatible with the relay protocol spec:
 
-Vitest uses `happy-dom` with `src/test/setup.ts` (WebSocket + URL mocks).
+| Function | Description |
+|---|---|
+| `generateECDHKeyPair()` | Ephemeral ECDH P-256 key pair |
+| `exportPublicKeyBase64(key)` | Serialise public key for the wire |
+| `importPublicKeyBase64(b64)` | Deserialise peer's public key |
+| `deriveSharedKey(priv, peerPub)` | ECDH → HKDF-SHA256 → AES-256-GCM `CryptoKey` |
+| `encryptChunk(key, plaintext)` | AES-256-GCM, random 12-byte IV → `[IV][ciphertext+tag]` |
+| `decryptChunk(key, encrypted)` | AES-256-GCM decrypt + implicit auth-tag check |
 
 ---
 
-## Build for Production
+## Tests / Build
 
 ```bash
-npm run build   # tsc -b && vite build → dist/
-npm run preview # serve dist/ locally to verify
+npm test       # vitest run (happy-dom; src/test/setup.ts has WS + URL mocks)
+npm run build  # tsc -b && vite build → dist/
+npm run preview
 ```
 
-`dist/` is a static SPA. All endpoints are baked in from the `VITE_*` env vars at
-build time, so rebuild after changing `VITE_RELAY_URL` / `VITE_AGENT_WS_URL`.
+`dist/` is a static SPA — drop it on any static host (Cloudflare Pages,
+GitHub Pages, Vercel, Netlify, S3, nginx). All endpoints are baked in from
+`VITE_*` env vars at build time, so rebuild after changing `VITE_RELAY_URL`.
+
+Frontend deployment guides:
+[../DEPLOYMENT-CLOUDFLARE-PAGES.md](../DEPLOYMENT-CLOUDFLARE-PAGES.md),
+[../DEPLOYMENT-GITHUB-PAGES.md](../DEPLOYMENT-GITHUB-PAGES.md).
