@@ -9,7 +9,7 @@ The LAN agent (mDNS + direct TCP between peers on the same network) is
 See the file headers for re-enable instructions.
 
 Wire protocol: [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
-Deployment: [../deploy/README.md](../deploy/README.md), [../DEPLOYMENT.md](../DEPLOYMENT.md), [../DEPLOYMENT-RENDER.md](../DEPLOYMENT-RENDER.md).
+Deployment: [../DEPLOYMENT-RENDER.md](../DEPLOYMENT-RENDER.md).
 
 ---
 

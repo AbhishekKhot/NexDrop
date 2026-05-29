@@ -40,13 +40,9 @@ NexDrop/
 │   └── README.md
 ├── docs/
 │   └── RELAY_PROTOCOL.md   ← Relay wire-protocol spec
-├── deploy/                 ← Relay deployment (Caddy, systemd, Docker)
-├── DEPLOYMENT.md           ← Oracle Cloud Free Tier walkthrough (VM)
-├── DEPLOYMENT-RENDER.md    ← Render free tier (PaaS) walkthrough
+├── DEPLOYMENT-RENDER.md    ← Relay on Render free tier (PaaS)
 ├── DEPLOYMENT-CLOUDFLARE-PAGES.md   ← Frontend on Cloudflare Pages
-├── DEPLOYMENT-GITHUB-PAGES.md       ← Frontend on GitHub Pages
-├── docker-compose.yml      ← relay + frontend in containers (local dev)
-└── render.yaml             ← One-click relay Blueprint
+└── render.yaml             ← Render Blueprint (one-click relay deploy)
 ```
 
 ---
@@ -83,15 +79,10 @@ cd frontend && npm install && npm run dev
 Open the frontend in two browsers, copy the share code from one into the
 other, and drop a file in.
 
-**Deploying to the cloud (Remote relay):**
+**Deploying to the cloud:**
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) — Oracle Cloud Free Tier VM (always-on)
-- [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md) — Render PaaS (click-deploy, sleeps after 15 min idle)
-
-**Deploying the frontend (static SPA):**
-
-- [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md) — Cloudflare Pages (unlimited bandwidth)
-- [DEPLOYMENT-GITHUB-PAGES.md](DEPLOYMENT-GITHUB-PAGES.md) — GitHub Pages (zero setup)
+- Relay → [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md) (Render free tier, click-deploy)
+- Frontend → [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md) (Cloudflare Pages, unlimited bandwidth)
 
 ---
 

@@ -128,6 +128,5 @@ npm run preview
 GitHub Pages, Vercel, Netlify, S3, nginx). All endpoints are baked in from
 `VITE_*` env vars at build time, so rebuild after changing `VITE_RELAY_URL`.
 
-Frontend deployment guides:
-[../DEPLOYMENT-CLOUDFLARE-PAGES.md](../DEPLOYMENT-CLOUDFLARE-PAGES.md),
-[../DEPLOYMENT-GITHUB-PAGES.md](../DEPLOYMENT-GITHUB-PAGES.md).
+Frontend deployment guide:
+[../DEPLOYMENT-CLOUDFLARE-PAGES.md](../DEPLOYMENT-CLOUDFLARE-PAGES.md).

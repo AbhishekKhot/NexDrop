@@ -1,9 +1,8 @@
 # Deploying the NexDrop frontend on Cloudflare Pages
 
 > **Frontend-only guide.** This deploys the static `frontend/dist/` SPA to
-> Cloudflare Pages. The relay (the live backend) is deployed separately —
-> see [DEPLOYMENT.md](DEPLOYMENT.md) (Oracle VM) or
-> [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md) (Render PaaS).
+> Cloudflare Pages. The relay (the live backend) is deployed separately on
+> Render — see [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md).
 
 Cloudflare Pages is the recommended free static host for the NexDrop frontend:
 

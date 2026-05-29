@@ -1,8 +1,9 @@
 # Deploying NexDrop on Render (free, click-deploy)
 
-> **Companion to [DEPLOYMENT.md](DEPLOYMENT.md).** Pick this guide if you want
-> the smallest possible deployment: no VM, no SSH, no Caddy, no DNS for the
-> relay. The Oracle guide is better if you need always-on without cold starts.
+> Smallest-possible deployment for the NexDrop relay: no VM, no SSH, no Caddy,
+> no DNS for the relay. The trade-off is Render's 15-minute idle sleep (one-time
+> ~30s cold start). Frontend deployment is covered in
+> [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md).
 
 Render's free tier hosts the **Remote relay**. The **frontend** goes on
 **Cloudflare Pages** (also free, no cold-start). End-to-end zero ongoing cost
@@ -125,11 +126,8 @@ service on **443** via Render's edge.
 
 ## Part 2 — Deploy the frontend on Cloudflare Pages
 
-> Two dedicated frontend guides also exist if you'd rather follow a focused
-> walkthrough:
->
-> - [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md) — same as below, with more detail
-> - [DEPLOYMENT-GITHUB-PAGES.md](DEPLOYMENT-GITHUB-PAGES.md) — alternative free static host (GitHub Actions auto-deploy)
+> A dedicated frontend guide also exists if you'd rather follow a focused
+> walkthrough: [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md).
 
 ### 2.1 Push (if not already) and connect
 
