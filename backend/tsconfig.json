@@ -1,7 +1,7 @@
 {
     "compilerOptions": {
         "target": "ES2022",
-        "module": "NodeNext",
+        "module": "commonjs",
         "lib": [
             "ES2022"
         ],
@@ -14,7 +14,8 @@
         "resolveJsonModule": true,
         "declaration": true,
         "sourceMap": true,
-        "moduleResolution": "NodeNext"
+        "moduleResolution": "node10",
+        "ignoreDeprecations": "6.0"
     },
     "include": [
         "src/**/*"
