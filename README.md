@@ -6,6 +6,8 @@ Two browsers, one share code, a file moves. The relay in the middle pairs the tw
 sides and forwards opaque ciphertext — it never sees the file contents or the
 encryption key.
 
+🌐 **Live Demo:** [https://nexdrop.khotabhishek469.workers.dev/](https://nexdrop.khotabhishek469.workers.dev/)
+
 ---
 
 ## Table of Contents
