@@ -1,15 +1,8 @@
 # NexDrop — Backend (Relay)
 
-Node.js + TypeScript. **One live entry point: the Remote relay** (`src/relay.ts`)
+Node.js + TypeScript. **One live entry point: the Remote relay**
 — a standalone WebSocket server that pairs two browsers by share code and
 forwards end-to-end-encrypted file chunks. The relay never sees plaintext.
-
-The LAN agent (mDNS + direct TCP between peers on the same network) is
-**line-commented in place** under `src/{index.ts, api/, discovery/, transport/tcp*, chunking/, crypto/}`.
-See the file headers for re-enable instructions.
-
-Wire protocol: [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
-Deployment: [../DEPLOYMENT-RENDER.md](../DEPLOYMENT-RENDER.md).
 
 ---
 
@@ -18,8 +11,8 @@ Deployment: [../DEPLOYMENT-RENDER.md](../DEPLOYMENT-RENDER.md).
 ```bash
 cd backend
 npm install
-cp .env.example .env          # optional — defaults are safe for local dev
-npm run dev                   # nodemon → ts-node → src/relay.ts
+cp .env.example .env         
+npm run dev                  
 ```
 
 Ready banner:
@@ -33,8 +26,6 @@ Ready banner:
 ║  Origins  : http://localhost:5173                 ║
 ╚══════════════════════════════════════════════════╝
 ```
-
-`curl http://localhost:4002/` → `NexDrop relay running`.
 
 ---
 
@@ -52,8 +43,7 @@ Ready banner:
 
 ## Environment Variables
 
-All relay settings come from environment variables. Most are sensibly defaulted
-for local dev; the only required value in production is `RELAY_ALLOWED_ORIGIN`.
+All relay settings come from environment variables.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -121,5 +111,3 @@ npx jest src/transport/relayServer.test.ts              # the relay suite
 npx jest -t "ROOM_FULL"                                 # one test by name
 ```
 
-The relay tests construct a `RelayServer` with a `Partial<RelayLimits>` override
-so tight TTLs and tiny caps can be exercised quickly without race conditions.

@@ -4,13 +4,6 @@ React 19 + Vite + TypeScript. Single-page SPA whose only job is to pair two
 browsers through the WebSocket relay and transfer end-to-end-encrypted files
 between them. No accounts, no logins, no uploads to the app's server.
 
-The frontend's only live page is the Remote share-code transfer screen. The
-former LAN mode UI (`pages/Lan.tsx`, `pages/Home.tsx`, `hooks/useAgentSocket`,
-`lib/agentSocket`) is **line-commented in place** — see file headers to
-re-enable.
-
-Wire protocol: [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
-
 ---
 
 ## Local Setup
@@ -18,12 +11,9 @@ Wire protocol: [../docs/RELAY_PROTOCOL.md](../docs/RELAY_PROTOCOL.md).
 ```bash
 cd frontend
 npm install
-cp .env.example .env          # optional; defaults assume relay on localhost:4002
-npm run dev                   # vite on http://localhost:5173
+cp .env.example .env          
+npm run dev                 
 ```
-
-You also need the relay running locally (`cd backend && npm run dev`).
-
 ---
 
 ## Environment Variables
@@ -119,14 +109,7 @@ Browser Web Crypto API, wire-compatible with the relay protocol spec:
 ## Tests / Build
 
 ```bash
-npm test       # vitest run (happy-dom; src/test/setup.ts has WS + URL mocks)
-npm run build  # tsc -b && vite build → dist/
+npm test     
+npm run build 
 npm run preview
 ```
-
-`dist/` is a static SPA — drop it on any static host (Cloudflare Pages,
-GitHub Pages, Vercel, Netlify, S3, nginx). All endpoints are baked in from
-`VITE_*` env vars at build time, so rebuild after changing `VITE_RELAY_URL`.
-
-Frontend deployment guide:
-[../DEPLOYMENT-CLOUDFLARE-PAGES.md](../DEPLOYMENT-CLOUDFLARE-PAGES.md).

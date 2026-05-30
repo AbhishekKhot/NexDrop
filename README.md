@@ -15,7 +15,6 @@ encryption key.
 - [Quick Start](#quick-start)
 - [Architecture Overview](#architecture-overview)
 - [Security Model](#security-model)
-- [LAN feature (disabled)](#lan-feature-disabled)
 
 ---
 
@@ -38,10 +37,6 @@ NexDrop/
 │   │   ├── lib/remoteCrypto.ts
 │   │   └── lib/remoteStatus.ts
 │   └── README.md
-├── docs/
-│   └── RELAY_PROTOCOL.md   ← Relay wire-protocol spec
-├── DEPLOYMENT-RENDER.md    ← Relay on Render free tier (PaaS)
-├── DEPLOYMENT-CLOUDFLARE-PAGES.md   ← Frontend on Cloudflare Pages
 └── render.yaml             ← Render Blueprint (one-click relay deploy)
 ```
 
@@ -78,12 +73,6 @@ cd frontend && npm install && npm run dev
 
 Open the frontend in two browsers, copy the share code from one into the
 other, and drop a file in.
-
-**Deploying to the cloud:**
-
-- Relay → [DEPLOYMENT-RENDER.md](DEPLOYMENT-RENDER.md) (Render free tier, click-deploy)
-- Frontend → [DEPLOYMENT-CLOUDFLARE-PAGES.md](DEPLOYMENT-CLOUDFLARE-PAGES.md) (Cloudflare Pages, unlimited bandwidth)
-
 ---
 
 ## Architecture Overview
@@ -135,8 +124,6 @@ sequenceDiagram
     R->>T: transfer_end  (assert N chunks → finalise download)
 ```
 
-Full wire-protocol spec: [docs/RELAY_PROTOCOL.md](docs/RELAY_PROTOCOL.md).
-
 ---
 
 ## Security Model
@@ -155,10 +142,5 @@ Full wire-protocol spec: [docs/RELAY_PROTOCOL.md](docs/RELAY_PROTOCOL.md).
 | Origin check on WS upgrade | Yes (CWE-352 / CSWSH) |
 | Rate limiting | Per-IP connection cap + per-conn token bucket + failed-join limit |
 | Resource bounds | 5 GiB byte cap per transfer, room TTLs, control-frame cap |
-
-**Remote mode is end-to-end encrypted but server-relayed — it is not pure P2P.**
-Only file contents are encrypted; file name and size travel as plaintext
-metadata visible to the relay (a deliberate v1 trade-off — see
-[docs/RELAY_PROTOCOL.md §12](docs/RELAY_PROTOCOL.md)).
 
 ---
